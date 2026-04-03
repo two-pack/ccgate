@@ -16,55 +16,130 @@ import (
 )
 
 const (
-	DefaultTimeoutMS  = 20_000
-	DefaultModel      = string(anthropic.ModelClaudeHaiku4_5)
-	DefaultProvider   = "anthropic"
-	DefaultLogPath    = "~/.claude/logs/ccgate.log"
-	DefaultLogMaxSize = 5 * 1024 * 1024 // 5MB
-	BaseConfigName    = "ccgate.jsonnet"
-	LocalConfigName   = "ccgate.local.jsonnet"
+	DefaultTimeoutMS      = 20_000
+	DefaultModel          = string(anthropic.ModelClaudeHaiku4_5)
+	DefaultProvider       = "anthropic"
+	DefaultLogMaxSize     = 5 * 1024 * 1024 // 5MB
+	DefaultMetricsMaxSize = 2 * 1024 * 1024 // 2MB
+	BaseConfigName        = "ccgate.jsonnet"
+	LocalConfigName       = "ccgate.local.jsonnet"
 )
 
 type Config struct {
-	Provider    ProviderConfig `json:"provider"`
-	LogPath     string         `json:"log_path"`
-	LogDisabled bool           `json:"log_disabled"`
-	LogMaxSize  int64          `json:"log_max_size"`
-	Allow       []string       `json:"allow"`
-	Deny        []string       `json:"deny"`
-	Environment []string       `json:"environment"`
+	Provider        ProviderConfig `json:"provider"`
+	LogPath         string         `json:"log_path"`
+	LogDisabled     *bool          `json:"log_disabled"`
+	LogMaxSize      *int64         `json:"log_max_size"`
+	MetricsPath     string         `json:"metrics_path"`
+	MetricsDisabled *bool          `json:"metrics_disabled"`
+	MetricsMaxSize  *int64         `json:"metrics_max_size"`
+	Allow           []string       `json:"allow"`
+	Deny            []string       `json:"deny"`
+	Environment     []string       `json:"environment"`
 }
 
 type ProviderConfig struct {
 	Name      string `json:"name"`
 	Model     string `json:"model"`
-	TimeoutMS int    `json:"timeout_ms"`
+	TimeoutMS *int   `json:"timeout_ms"`
+}
+
+// GetTimeoutMS returns the timeout in milliseconds.
+// nil defaults to DefaultTimeoutMS; 0 means no timeout.
+func (p ProviderConfig) GetTimeoutMS() int {
+	if p.TimeoutMS == nil {
+		return DefaultTimeoutMS
+	}
+	return *p.TimeoutMS
 }
 
 func Default() Config {
+	sd := stateDir()
 	return Config{
 		Provider: ProviderConfig{
 			Name:      DefaultProvider,
 			Model:     DefaultModel,
-			TimeoutMS: DefaultTimeoutMS,
+			TimeoutMS: intPtr(DefaultTimeoutMS),
 		},
-		LogPath:    DefaultLogPath,
-		LogMaxSize: DefaultLogMaxSize,
+		LogPath:        filepath.Join(sd, "ccgate.log"),
+		LogMaxSize:     int64Ptr(DefaultLogMaxSize),
+		MetricsPath:    filepath.Join(sd, "metrics.jsonl"),
+		MetricsMaxSize: int64Ptr(DefaultMetricsMaxSize),
 	}
 }
 
-// ResolveLogPath expands ~ in LogPath and returns the absolute path.
-func (c Config) ResolveLogPath() string {
-	p := c.LogPath
-	if p == "" {
-		p = DefaultLogPath
+func intPtr(v int) *int       { return &v }
+func int64Ptr(v int64) *int64 { return &v }
+
+// GetTimeoutMS returns the provider timeout in milliseconds.
+// nil defaults to DefaultTimeoutMS.
+func (c Config) GetTimeoutMS() int {
+	return c.Provider.GetTimeoutMS()
+}
+
+// IsLogDisabled returns whether logging is disabled.
+func (c Config) IsLogDisabled() bool {
+	return c.LogDisabled != nil && *c.LogDisabled
+}
+
+// IsMetricsDisabled returns whether metrics collection is disabled.
+func (c Config) IsMetricsDisabled() bool {
+	return c.MetricsDisabled != nil && *c.MetricsDisabled
+}
+
+// GetLogMaxSize returns the log max size, defaulting to DefaultLogMaxSize.
+// 0 means no rotation.
+func (c Config) GetLogMaxSize() int64 {
+	if c.LogMaxSize == nil {
+		return DefaultLogMaxSize
 	}
+	return *c.LogMaxSize
+}
+
+// GetMetricsMaxSize returns the metrics max size, defaulting to DefaultMetricsMaxSize.
+// 0 means no rotation.
+func (c Config) GetMetricsMaxSize() int64 {
+	if c.MetricsMaxSize == nil {
+		return DefaultMetricsMaxSize
+	}
+	return *c.MetricsMaxSize
+}
+
+// stateDir returns the XDG_STATE_HOME-based directory for ccgate state (logs, metrics).
+func stateDir() string {
+	if d := os.Getenv("XDG_STATE_HOME"); d != "" && filepath.IsAbs(d) {
+		return filepath.Join(d, "ccgate")
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".local", "state", "ccgate")
+	}
+	return "."
+}
+
+// resolvePath expands ~ prefix in a path.
+func resolvePath(p string) string {
 	if after, ok := strings.CutPrefix(p, "~/"); ok {
 		if home, err := os.UserHomeDir(); err == nil {
 			return filepath.Join(home, after)
 		}
 	}
 	return p
+}
+
+// ResolveLogPath returns the resolved log file path.
+func (c Config) ResolveLogPath() string {
+	if c.LogPath == "" {
+		return filepath.Join(stateDir(), "ccgate.log")
+	}
+	return resolvePath(c.LogPath)
+}
+
+// ResolveMetricsPath returns the resolved metrics file path.
+func (c Config) ResolveMetricsPath() string {
+	if c.MetricsPath == "" {
+		return filepath.Join(stateDir(), "metrics.jsonl")
+	}
+	return resolvePath(c.MetricsPath)
 }
 
 // Load reads the base config from ~/.claude/ and merges project-local overrides.
@@ -159,17 +234,26 @@ func mergeConfigFile(path string, cfg *Config) error {
 	if override.Provider.Model != "" {
 		cfg.Provider.Model = override.Provider.Model
 	}
-	if override.Provider.TimeoutMS > 0 {
+	if override.Provider.TimeoutMS != nil {
 		cfg.Provider.TimeoutMS = override.Provider.TimeoutMS
 	}
 	if override.LogPath != "" {
 		cfg.LogPath = override.LogPath
 	}
-	if override.LogDisabled {
-		cfg.LogDisabled = true
+	if override.LogDisabled != nil {
+		cfg.LogDisabled = override.LogDisabled
 	}
-	if override.LogMaxSize > 0 {
+	if override.LogMaxSize != nil {
 		cfg.LogMaxSize = override.LogMaxSize
+	}
+	if override.MetricsPath != "" {
+		cfg.MetricsPath = override.MetricsPath
+	}
+	if override.MetricsDisabled != nil {
+		cfg.MetricsDisabled = override.MetricsDisabled
+	}
+	if override.MetricsMaxSize != nil {
+		cfg.MetricsMaxSize = override.MetricsMaxSize
 	}
 
 	cfg.Allow = append(cfg.Allow, override.Allow...)

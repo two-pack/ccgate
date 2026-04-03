@@ -40,10 +40,19 @@ type PermissionPromptInput struct {
 	RecentTranscript      hookctx.RecentTranscript    `json:"recent_transcript"`
 }
 
-func callAnthropic(parent context.Context, cfg config.Config, input hookctx.HookInput, apiKey string) (PermissionLLMOutput, error) {
-	timeout := time.Duration(cfg.Provider.TimeoutMS) * time.Millisecond
-	ctx, cancel := context.WithTimeout(parent, timeout)
-	defer cancel()
+// APIUsage holds token usage from the Anthropic API response.
+type APIUsage struct {
+	InputTokens  int64
+	OutputTokens int64
+}
+
+func callAnthropic(parent context.Context, cfg config.Config, input hookctx.HookInput, apiKey string) (PermissionLLMOutput, *APIUsage, error) {
+	ctx := parent
+	if t := cfg.GetTimeoutMS(); t > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(parent, time.Duration(t)*time.Millisecond)
+		defer cancel()
+	}
 
 	client := anthropic.NewClient(
 		option.WithAPIKey(apiKey),
@@ -69,7 +78,7 @@ func callAnthropic(parent context.Context, cfg config.Config, input hookctx.Hook
 
 	userMessage, err := marshalJSON(promptInput)
 	if err != nil {
-		return PermissionLLMOutput{}, fmt.Errorf("marshal prompt input: %w", err)
+		return PermissionLLMOutput{}, nil, fmt.Errorf("marshal prompt input: %w", err)
 	}
 
 	slog.Info("anthropic request",
@@ -79,7 +88,7 @@ func callAnthropic(parent context.Context, cfg config.Config, input hookctx.Hook
 
 	schema, err := permissionOutputSchema()
 	if err != nil {
-		return PermissionLLMOutput{}, fmt.Errorf("generate output schema: %w", err)
+		return PermissionLLMOutput{}, nil, fmt.Errorf("generate output schema: %w", err)
 	}
 
 	message, err := client.Messages.New(ctx, anthropic.MessageNewParams{
@@ -101,24 +110,34 @@ func callAnthropic(parent context.Context, cfg config.Config, input hookctx.Hook
 		Temperature: anthropic.Float(0),
 	})
 	if err != nil {
-		return PermissionLLMOutput{}, fmt.Errorf("anthropic API: %w", err)
+		return PermissionLLMOutput{}, nil, fmt.Errorf("anthropic API: %w", err)
+	}
+
+	usage := &APIUsage{
+		InputTokens:  message.Usage.InputTokens,
+		OutputTokens: message.Usage.OutputTokens,
+	}
+
+	if message.StopReason == anthropic.StopReasonMaxTokens || message.StopReason == anthropic.StopReasonRefusal {
+		slog.Warn("anthropic response truncated or refused", "stop_reason", message.StopReason)
+		return PermissionLLMOutput{}, usage, nil // treat as fallthrough
 	}
 
 	text := extractMessageText(message)
 	slog.Info("anthropic response", "raw", text)
 	if text == "" {
-		return PermissionLLMOutput{}, nil
+		return PermissionLLMOutput{}, usage, nil
 	}
 
 	var output PermissionLLMOutput
 	if err := json.Unmarshal([]byte(text), &output); err != nil {
-		return PermissionLLMOutput{}, fmt.Errorf("parse LLM response: %w", err)
+		return PermissionLLMOutput{}, usage, fmt.Errorf("parse LLM response: %w", err)
 	}
 	if output.Behavior == BehaviorDeny && strings.TrimSpace(output.DenyMessage) == "" {
 		output.DenyMessage = DefaultDenyMessage
 	}
 
-	return output, nil
+	return output, usage, nil
 }
 
 func buildSystemPrompt(cfg config.Config) string {
@@ -127,9 +146,9 @@ func buildSystemPrompt(cfg config.Config) string {
 	b.WriteString("Return one of: allow, deny, fallthrough.\n")
 	b.WriteString("Decide quickly. Do not deliberate or reconsider.\n\n")
 	b.WriteString("Decision rules:\n")
-	b.WriteString("- deny: When a deny guidance rule matches, OR a built-in rule matches. Mandatory.\n")
+	b.WriteString("- deny: When a deny guidance rule matches, OR a built-in rule matches. EXCEPT: if recent_transcript shows the user explicitly requested the operation, use fallthrough instead of deny to let the user confirm.\n")
 	b.WriteString("- allow: When the operation matches allow guidance, OR is a routine development operation (build, test, lint, git, file read/write) in the current repository.\n")
-	b.WriteString("- fallthrough: Only when genuinely uncertain about safety.\n\n")
+	b.WriteString("- fallthrough: When genuinely uncertain, OR when a deny rule matches but the user explicitly requested the operation.\n\n")
 	b.WriteString("Built-in deny rules:\n")
 	b.WriteString("- Direct tool invocation (npx, pnpm exec, etc.): Deny when a command bypasses project scripts by invoking tools directly. Prefer project-defined scripts (e.g. pnpm format over pnpm exec prettier). deny_message: プロジェクトのスクリプトを使用してください。\n\n")
 	b.WriteString("Always provide a brief reason for your decision.\n")

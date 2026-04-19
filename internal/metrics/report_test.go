@@ -51,6 +51,13 @@ func TestBuildReport(t *testing.T) {
 	if ds.TotalInputTokens != 350 {
 		t.Fatalf("input_tokens = %d, want 350", ds.TotalInputTokens)
 	}
+	// (allow=2 + deny=1) / total=4 = 0.75
+	if ds.AutomationRate != 0.75 {
+		t.Fatalf("AutomationRate = %v, want 0.75", ds.AutomationRate)
+	}
+	if report.AutomationRate != 0.75 {
+		t.Fatalf("report.AutomationRate = %v, want 0.75", report.AutomationRate)
+	}
 
 	if len(report.Tools) != 2 {
 		t.Fatalf("expected 2 tools, got %d", len(report.Tools))
@@ -122,21 +129,33 @@ func TestPrintReportTable(t *testing.T) {
 	path := filepath.Join(dir, "test.jsonl")
 
 	now := time.Now().UTC()
+	// Mix allow/deny/fallthrough(llm) so every top section and every
+	// automation-rate branch is exercised in the same rendering.
 	writeEntries(t, path, []Entry{
 		{Timestamp: now, ToolName: "Bash", Decision: "allow", ElapsedMS: 100},
+		{Timestamp: now, ToolName: "Bash", Decision: "deny", ElapsedMS: 100,
+			ToolInput: ToolInputFields{Command: "rm -rf /"}},
+		{Timestamp: now, ToolName: "Bash", Decision: "fallthrough", FallthroughKind: "llm",
+			ToolInput: ToolInputFields{Command: "gh pr list"}, ElapsedMS: 100},
 	})
 
 	var buf bytes.Buffer
-	if err := PrintReport(&buf, path, ReportOptions{Days: 7}); err != nil {
+	if err := PrintReport(&buf, path, ReportOptions{Days: 7, DetailsTop: 10}); err != nil {
 		t.Fatal(err)
 	}
 
 	output := buf.String()
-	if !strings.Contains(output, "ccgate metrics") {
-		t.Fatal("expected header in table output")
-	}
-	if !strings.Contains(output, "Bash") {
-		t.Fatal("expected Bash in table output")
+	for _, want := range []string{
+		"ccgate metrics",
+		"Bash",
+		"Auto%",
+		"Automation rate:",
+		"Top fallthrough commands",
+		"Top deny commands",
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("expected %q in table output; got:\n%s", want, output)
+		}
 	}
 }
 
@@ -153,6 +172,23 @@ func writeEntries(t *testing.T, path string, entries []Entry) {
 			t.Fatal(err)
 		}
 		if _, err := f.Write(append(line, '\n')); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// writeRawJSONLines writes pre-constructed JSONL lines without going through
+// Entry serialization. Used to simulate entries written by an older binary
+// that didn't know about tool_input.
+func writeRawJSONLines(t *testing.T, path string, lines []string) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	for _, line := range lines {
+		if _, err := f.WriteString(line + "\n"); err != nil {
 			t.Fatal(err)
 		}
 	}

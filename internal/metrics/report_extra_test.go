@@ -461,6 +461,84 @@ func TestPrintReportMultilineCommandDisplay(t *testing.T) {
 	}
 }
 
+func TestBuildReportForcedAggregation(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.jsonl")
+	now := time.Now().UTC()
+
+	writeEntries(t, path, []Entry{
+		// Natural LLM fallthrough.
+		{Timestamp: now, ToolName: "Bash", Decision: "fallthrough", FallthroughKind: "llm",
+			ToolInput: ToolInputFields{Command: "natural ft"}, ElapsedMS: 1},
+		// Rule-driven deny (no LLM uncertainty).
+		{Timestamp: now, ToolName: "Bash", Decision: "deny",
+			ToolInput: ToolInputFields{Command: "rm -rf /"}, ElapsedMS: 1},
+		// Forced deny: was an LLM fallthrough that fallthrough_strategy=deny converted.
+		{Timestamp: now, ToolName: "Bash", Decision: "deny", FallthroughKind: "llm", Forced: true,
+			ToolInput: ToolInputFields{Command: "forced deny cmd"}, ElapsedMS: 1},
+		// Forced allow: was an LLM fallthrough that fallthrough_strategy=allow converted.
+		{Timestamp: now, ToolName: "Bash", Decision: "allow", FallthroughKind: "llm", Forced: true,
+			ToolInput: ToolInputFields{Command: "forced allow cmd"}, ElapsedMS: 1},
+	})
+
+	report, _, err := buildReport(path, ReportOptions{Days: 7, DetailsTop: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(report.Daily) != 1 {
+		t.Fatalf("expected 1 daily, got %d", len(report.Daily))
+	}
+	ds := report.Daily[0]
+	if ds.ForcedAllow != 1 {
+		t.Errorf("Daily.ForcedAllow = %d, want 1", ds.ForcedAllow)
+	}
+	if ds.ForcedDeny != 1 {
+		t.Errorf("Daily.ForcedDeny = %d, want 1", ds.ForcedDeny)
+	}
+
+	// Per-tool ToolSummary should mirror the daily forced split for Bash
+	// (the only tool present in this fixture).
+	if len(report.Tools) != 1 || report.Tools[0].ToolName != "Bash" {
+		t.Fatalf("expected single Bash tool summary, got %+v", report.Tools)
+	}
+	ts := report.Tools[0]
+	if ts.ForcedAllow != 1 {
+		t.Errorf("Tools[0].ForcedAllow = %d, want 1", ts.ForcedAllow)
+	}
+	if ts.ForcedDeny != 1 {
+		t.Errorf("Tools[0].ForcedDeny = %d, want 1", ts.ForcedDeny)
+	}
+
+	// FallthroughTop must include all three LLM-uncertainty entries
+	// (natural ft + forced deny + forced allow), each in its own group.
+	wantFTCommands := map[string]bool{
+		"natural ft":       true,
+		"forced deny cmd":  true,
+		"forced allow cmd": true,
+	}
+	if len(report.FallthroughTop) != len(wantFTCommands) {
+		t.Fatalf("len(FallthroughTop) = %d, want %d. content: %+v",
+			len(report.FallthroughTop), len(wantFTCommands), report.FallthroughTop)
+	}
+	for _, s := range report.FallthroughTop {
+		if !wantFTCommands[s.ToolInput.Command] {
+			t.Errorf("unexpected entry in FallthroughTop: %+v", s)
+		}
+	}
+
+	// DenyTop must include the rule-driven deny only; the forced deny
+	// belongs in FallthroughTop, not here.
+	if len(report.DenyTop) != 1 {
+		t.Fatalf("len(DenyTop) = %d, want 1 (rule-driven only). content: %+v",
+			len(report.DenyTop), report.DenyTop)
+	}
+	if report.DenyTop[0].ToolInput.Command != "rm -rf /" {
+		t.Errorf("DenyTop[0].Command = %q, want %q", report.DenyTop[0].ToolInput.Command, "rm -rf /")
+	}
+}
+
 func TestPrintReportColumnAlignment(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -518,12 +596,18 @@ func TestPrintReportColumnAlignment(t *testing.T) {
 	// (directly before the literal "/"). Including it here catches regressions
 	// where that column alone is flipped to %-*s (left-align) and values are
 	// padded on the wrong side.
-	rightAlignedLabels := []string{"Total", "Allow", "Deny", "Fall", "Err", "Auto%", "Avg(ms)", "Tokens(in"}
+	// Anchor each label by searching for " "+label, never the bare label.
+	// This avoids the substring trap where strings.Index(header, "Allow")
+	// would silently latch onto "F.Allow" if the column order ever changes
+	// (currently safe only because "Allow" precedes "F.Allow" in header).
+	rightAlignedLabels := []string{"Total", "Allow", "Deny", "Fall", "F.Allow", "F.Deny", "Err", "Auto%", "Avg(ms)", "Tokens(in"}
 	for _, label := range rightAlignedLabels {
-		anchor := strings.Index(header, label)
+		needle := " " + label
+		anchor := strings.Index(header, needle)
 		if anchor < 0 {
 			t.Fatalf("header missing label %q: %q", label, header)
 		}
+		anchor++ // step past the leading space so anchor points at label start
 		endOffset := anchor + len(label) - 1
 		for _, r := range dataRows {
 			if endOffset+1 >= len(r) {

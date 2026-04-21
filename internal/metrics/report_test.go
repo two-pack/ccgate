@@ -149,6 +149,8 @@ func TestPrintReportTable(t *testing.T) {
 		"ccgate metrics",
 		"Bash",
 		"Auto%",
+		"F.Allow",
+		"F.Deny",
 		"Automation rate:",
 		"Top fallthrough commands",
 		"Top deny commands",

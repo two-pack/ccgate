@@ -164,7 +164,10 @@ func runHook() int {
 	result, err := gate.DecidePermission(ctx, cfg, input)
 	elapsed := time.Since(start)
 
-	// Record metrics (fire-and-forget).
+	// Record metrics (fire-and-forget). user_interaction fallthrough is still
+	// written so an audit trail exists; it is filtered out at aggregation time
+	// (see metrics.aggregate) so it does not pollute automation_rate / Fall /
+	// tool totals.
 	if !cfg.IsMetricsDisabled() {
 		entry := buildMetricsEntry(start, elapsed, input, cfg, result, err)
 		metrics.Record(cfg.ResolveMetricsPath(), cfg.GetMetricsMaxSize(), entry)

@@ -156,12 +156,16 @@ Claude Code と同じ環境変数 (`CCGATE_ANTHROPIC_API_KEY` / `ANTHROPIC_API_K
 
 | 順序 | Claude Code | Codex CLI |
 |----:|-------------|-----------|
-| 1 | 組み込みデフォルト (グローバル設定がない場合のフォールバック) | 同じ |
-| 2 | `~/.claude/ccgate.jsonnet` — グローバル (組み込みデフォルトを**完全に置換**) | `~/.codex/ccgate.jsonnet` — グローバル (同じ) |
-| 3 | `{repo_root}/.claude/ccgate.local.jsonnet` — プロジェクトローカル (Git 未追跡のみ、**追加**) | `{repo_root}/.codex/ccgate.local.jsonnet` — プロジェクトローカル (同じ) |
+| 1 | 組み込みデフォルト (常にベースとして適用) | 同じ |
+| 2 | `~/.claude/ccgate.jsonnet` — グローバル (上に重ねる) | `~/.codex/ccgate.jsonnet` — グローバル (同じ) |
+| 3 | `{repo_root}/.claude/ccgate.local.jsonnet` — プロジェクトローカル (Git 未追跡のみ、上に重ねる) | `{repo_root}/.codex/ccgate.local.jsonnet` — プロジェクトローカル (同じ) |
 
-グローバル設定が存在する場合、組み込みデフォルトは**使われません**。グローバル設定が完全なベースです。
-プロジェクトローカル設定は常にベースに**追加**されます (allow/deny/environment は append、provider 系は overwrite)。
+3 つの layer はすべて同じ merge ルールで合成されます:
+
+- **list**: `allow` / `deny` / `environment` は値を設定した layer が前の layer から引き継いだ list を **置き換える** (`[]` を書けば空 list に置き換え)。`append_*` 系 (`append_allow` / `append_deny` / `append_environment`) は前の layer の累積 list の **末尾に追加** する。
+- **スカラー**: `provider.*` / `log_*` / `metrics_*` / `fallthrough_strategy` はその layer がフィールドを設定していれば per-field で上書き、設定していなければ前の値を保持。
+
+`~/.<target>/ccgate.jsonnet` で `provider.model` だけ書き換えれば embedded の `allow` / `deny` はそのまま残ります。`allow: [...]` を書けば embedded の allow を完全に差し替え (これは v0.6 以前のグローバル設定がすでに行っていた挙動なので、そのまま冪等)。プロジェクトローカル設定は典型的に `append_deny: [...]` / `append_environment: [...]` で追加制限を載せます。
 プロジェクトローカル設定は **Git に追跡されていないファイルのみ** 読み込まれます。
 
 
@@ -179,27 +183,33 @@ Claude Code と同じ環境変数 (`CCGATE_ANTHROPIC_API_KEY` / `ANTHROPIC_API_K
 | `metrics_disabled`       | bool                              | `false`                                                                         | メトリクス収集を完全に無効化                                                                               |
 | `metrics_max_size`       | int                               | `2097152`                                                                       | ローテーション閾値 (bytes, デフォルト 2MB)。`0` = ローテーションなし                                       |
 | `fallthrough_strategy`   | `"ask"` / `"allow"` / `"deny"`    | `"ask"`                                                                         | LLM が判定に迷った (`fallthrough`) 際の扱い。[完全自動運転モード](#完全自動運転モード-fallthrough_strategy) 参照 |
-| `allow`                  | string[]                          | `[]`                                                                            | 許可ルール (自然言語、LLM が解釈)                                                                          |
-| `deny`                   | string[]                          | `[]`                                                                            | 拒否ルール (mandatory)。`deny_message:` ヒント対応                                                         |
-| `environment`            | string[]                          | `[]`                                                                            | LLM に渡すコンテキスト (信頼レベル、ポリシー等)                                                            |
+| `allow`                  | string[]                          | `[]`                                                                            | 許可ルール。設定すると前の layer から引き継いだ list を **完全置換**                                       |
+| `deny`                   | string[]                          | `[]`                                                                            | 拒否ルール (mandatory)。`deny_message:` ヒント対応。`allow` と同じく置換                                   |
+| `environment`            | string[]                          | `[]`                                                                            | LLM に渡すコンテキスト (信頼レベル、ポリシー等)。`allow` と同じく置換                                       |
+| `append_allow`           | string[]                          | `[]`                                                                            | 引き継いだ list の末尾に **追加**。プロジェクトローカル設定で典型的に使用                                  |
+| `append_deny`            | string[]                          | `[]`                                                                            | 引き継いだ deny list の末尾に追加                                                                          |
+| `append_environment`     | string[]                          | `[]`                                                                            | 引き継いだ environment list の末尾に追加                                                                   |
 
 `<target>` は Claude / Codex どちらの hook が呼ばれたかで `claude` / `codex` になります。`XDG_STATE_HOME` が未設定の場合は `~/.local/state/ccgate/<target>/...` が fallback として使われます。
 
 ## デフォルトルール
 
-グローバル設定がない場合、ccgate は組み込みのデフォルトルールを使用します (target ごと):
+ccgate は target ごとに組み込みのデフォルトルールを持っています。常にベースとして適用され、その上にグローバル / プロジェクトローカル設定が重なります。
 
 **許可:** 読み取り専用操作、ローカル開発コマンド (project script 経由の build / test)、git フィーチャーブランチ操作、リポジトリ内に閉じたパッケージインストール。
 
 **拒否:** リモートコードのダウンロード実行 (`curl|bash`)、direct one-shot remote package execution (`npx`/`pnpx`/`bunx` 等)、git 破壊的操作 (protected branch 含む)、リポジトリ外の削除、特権昇格。
 
-`ccgate claude init` / `ccgate codex init` でデフォルト設定の全容を確認できます。カスタマイズする場合:
+`ccgate claude init` / `ccgate codex init` でデフォルト設定の全容を確認できます。`init` の出力は **embedded defaults そのもの** = リファレンス文書であって、コピペして使う出発点ではありません。自分のオーバーライドは追加 / 上書きしたい分だけを書く最小限の jsonnet にしてください:
 
 ```bash
-ccgate claude init    > ~/.claude/ccgate.jsonnet           # グローバル, claude (デフォルトを置換)
-ccgate claude init -p > .claude/ccgate.local.jsonnet       # プロジェクトローカルテンプレート, claude (追加)
-ccgate codex  init    > ~/.codex/ccgate.jsonnet            # グローバル, codex
+ccgate claude init           | less                   # Claude embedded defaults を確認
+ccgate codex  init           | less                   # Codex も同じ
+ccgate claude init -p > .claude/ccgate.local.jsonnet  # プロジェクトローカルのスケルトン
+ccgate codex  init -p > .codex/ccgate.local.jsonnet   # Codex も同じ
 ```
+
+embedded のルールを **削除** したい場合は明示的な reset/override 構文が必要ですが、現状そのような仕組みはありません。ルールと動機を Issue に書いてもらえれば検討します。
 
 ## 完全自動運転モード (`fallthrough_strategy`)
 
@@ -249,7 +259,7 @@ ccgate codex  metrics --days 7        # codex 側、同じシェイプ
 ## 既知の制約
 
 - **Plan mode の正しさはプロンプトのみに依存 (Claude のみ)。** `permission_mode == "plan"` では、(a) 実装系 write を拒絶する判定と (b) allow guidance に載っていない read-only クエリを許可する判定の両方を、LLM とシステムプロンプトの指示文に委ねています。プロンプトで記述する以上、どちらの方向にも誤判定の余地があります。[#37](https://github.com/tak848/ccgate/issues/37) で追跡しています。
-- **設定ファイル layering の非対称。** グローバル設定は組み込みデフォルトを*置換*するのに対し、プロジェクトローカルは*追加のみ*。プロジェクト層からルールを狭める/上書きする手段がありません。互換性を壊す破壊的リファクタとして [#38](https://github.com/tak848/ccgate/issues/38) で追跡しています。
+- **embedded default の特定ルールだけを部分削除する手段なし。** layer は list を **完全置換** (`allow: [...]`) するか **末尾追加** (`append_allow: [...]`) するかのどちらかです。embedded の中の 1 ルールだけ消したい場合は、その 1 件を除いた残り全部を `allow:` / `deny:` に書き直すしかありません。
 - **Codex hook は upstream で experimental。** スキーマや挙動が変わる可能性があります。ccgate は現在 Codex 側の `permission_mode` を expose せず、transcript JSONL を parse せず、`~/.codex/config.toml` も取り込まず、MCP server 単位の trust hint も適用しません。判定は `tool_name` + `tool_input` + `cwd` のみで行います。
 
 ## ドキュメント

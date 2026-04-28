@@ -43,9 +43,22 @@ type Config struct {
 	MetricsDisabled     *bool          `json:"metrics_disabled,omitempty"`
 	MetricsMaxSize      *int64         `json:"metrics_max_size,omitempty"`
 	FallthroughStrategy *string        `json:"fallthrough_strategy,omitempty"`
-	Allow               []string       `json:"allow,omitempty"`
-	Deny                []string       `json:"deny,omitempty"`
-	Environment         []string       `json:"environment,omitempty"`
+	// Allow / Deny / Environment replace the value carried over from
+	// previous layers when the layer sets them (even to []). Embedded
+	// defaults are always layer 0, so writing `allow: [...]` in your
+	// global or project-local config completely overrides ccgate's
+	// shipped allow list. Use AppendAllow / AppendDeny / AppendEnvironment
+	// when you want to add on top instead.
+	Allow       []string `json:"allow,omitempty"`
+	Deny        []string `json:"deny,omitempty"`
+	Environment []string `json:"environment,omitempty"`
+	// AppendAllow / AppendDeny / AppendEnvironment append onto the
+	// list carried over from previous layers regardless of whether
+	// the same layer also sets the replace-mode field. Typical
+	// project-local use is `append_deny: ['<repo-specific>']`.
+	AppendAllow       []string `json:"append_allow,omitempty"`
+	AppendDeny        []string `json:"append_deny,omitempty"`
+	AppendEnvironment []string `json:"append_environment,omitempty"`
 }
 
 // GetFallthroughStrategy returns the configured strategy for LLM fallthrough,
@@ -188,12 +201,14 @@ type LoadOptions struct {
 	GlobalConfigPath string
 	// ProjectLocalRelativePaths lists project-local config locations
 	// relative to the repo root (or cwd when not in a git repo).
-	// Each candidate is read in order and **appended** on top of the
-	// global / embedded base. Tracked files are skipped via gitutil.
+	// Each candidate is read in order and layered on top of the
+	// global / embedded base using the same replace-or-append-*
+	// semantics every layer follows (see Load). Tracked files are
+	// skipped via gitutil.
 	ProjectLocalRelativePaths []string
-	// EmbedDefaults is the embedded jsonnet snippet applied when the
-	// global config is absent. Targets ship their own defaults via
-	// //go:embed.
+	// EmbedDefaults is the embedded jsonnet snippet always applied
+	// as the first layer (the always-present base ccgate ships
+	// with). Targets ship their own defaults via //go:embed.
 	EmbedDefaults string
 	// DefaultLogPath is used when neither the global nor any
 	// project-local config sets log_path. Empty string falls back
@@ -211,21 +226,40 @@ func StateDir(sub string) string {
 	return filepath.Join(stateDir(), sub)
 }
 
-// Load reads the base config from opts.GlobalConfigPath and merges
-// project-local overrides found at opts.ProjectLocalRelativePaths
-// (resolved against the git repo root, or cwd when not in a repo).
-// If no global config exists, opts.EmbedDefaults is used as fallback.
+// Load composes the runtime config from three layers, all using the
+// same merge semantics:
+//
+//   - lists `allow` / `deny` / `environment` REPLACE the carried-over
+//     value when the layer sets them (an explicit empty list clears),
+//   - lists `append_allow` / `append_deny` / `append_environment` ADD
+//     onto the carried-over value (can coexist with the replace-mode
+//     field; replace runs first, append stacks),
+//   - scalars (`provider.*` / `log_*` / `metrics_*` /
+//     `fallthrough_strategy`) overwrite per-field when set.
+//
+// Layers, applied in order:
+//
+//  1. opts.EmbedDefaults -- always applied first, the always-present
+//     base ccgate ships with.
+//  2. opts.GlobalConfigPath -- if the file exists, layered on top.
+//  3. opts.ProjectLocalRelativePaths -- each existing untracked file
+//     under the repo root, layered on top in the order given.
+//
+// Pre-v0.6 ccgate skipped step 1 whenever step 2 succeeded, which
+// made the global layer "replace" embedded defaults while project
+// layers always "appended". v0.6 makes embedded defaults the
+// always-present base and adds explicit `append_*` keys for opt-in
+// extension; see issue #38 for the discussion.
 func Load(opts LoadOptions, cwd string) (LoadResult, error) {
 	cfg := Default()
 
+	if err := mergeConfigString(opts.EmbedDefaults, &cfg); err != nil {
+		return LoadResult{Config: cfg}, fmt.Errorf("embedded defaults: %w", err)
+	}
+
 	source := SourceEmbeddedDefaults
 	if err := mergeConfigFile(opts.GlobalConfigPath, &cfg); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			// No global config: use embedded defaults as fallback.
-			if err := mergeConfigString(opts.EmbedDefaults, &cfg); err != nil {
-				return LoadResult{Config: cfg}, fmt.Errorf("embedded defaults: %w", err)
-			}
-		} else {
+		if !errors.Is(err, os.ErrNotExist) {
 			return LoadResult{Config: cfg}, fmt.Errorf("base config %s: %w", opts.GlobalConfigPath, err)
 		}
 	} else {
@@ -360,9 +394,32 @@ func mergeConfigJSON(data string, cfg *Config) error {
 		cfg.FallthroughStrategy = override.FallthroughStrategy
 	}
 
-	cfg.Allow = append(cfg.Allow, override.Allow...)
-	cfg.Deny = append(cfg.Deny, override.Deny...)
-	cfg.Environment = append(cfg.Environment, override.Environment...)
+	// Lists: `allow` / `deny` / `environment` REPLACE the value
+	// carried over from earlier layers when the current layer sets
+	// the field (non-nil, even an explicit empty list). Layers that
+	// omit the field leave the prior value untouched. `append_*`
+	// extends instead of replacing -- both forms can coexist in the
+	// same layer, in which case the replace runs first and the
+	// append stacks onto the result.
+	if override.Allow != nil {
+		cfg.Allow = override.Allow
+	}
+	cfg.Allow = append(cfg.Allow, override.AppendAllow...)
+	if override.Deny != nil {
+		cfg.Deny = override.Deny
+	}
+	cfg.Deny = append(cfg.Deny, override.AppendDeny...)
+	if override.Environment != nil {
+		cfg.Environment = override.Environment
+	}
+	cfg.Environment = append(cfg.Environment, override.AppendEnvironment...)
+
+	// `append_*` is parse-time-only; clear so the resolved Config
+	// reflects the merged final lists in `Allow` / `Deny` /
+	// `Environment` and never leaks the per-layer extensions.
+	cfg.AppendAllow = nil
+	cfg.AppendDeny = nil
+	cfg.AppendEnvironment = nil
 
 	return nil
 }

@@ -96,5 +96,5 @@ Codex 側の詳細は [docs/ja/codex.md](codex.md) を参照。
 ## 既知の制約
 
 - **Plan mode はプロンプト依存** ([#37](https://github.com/tak848/ccgate/issues/37))
-- **layering 非対称**: global (置換) と project-local (追加) の差 ([#38](https://github.com/tak848/ccgate/issues/38))
+- **embedded default の特定ルールだけを部分削除する手段なし**: layer は list を **完全置換** (`allow: [...]`) するか **末尾追加** (`append_allow: [...]`) するかのどちらかで、embedded の中の 1 ルールだけ消したい場合は残り全部を `allow:` / `deny:` に書き直すしかない
 - **`settings.json` の deny パターンに対する deterministic short-circuit なし**: ccgate は現状すべての Claude Code PermissionRequest を LLM に通します。literal な `settings.json` deny match で early exit する deterministic prefilter は将来の最適化候補で、現時点の挙動ではありません

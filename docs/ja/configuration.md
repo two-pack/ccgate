@@ -6,26 +6,30 @@ target 横断の設定リファレンス。[ルート README (docs/ja/README.md)
 
 ## ccgate が config を探す場所
 
-ccgate は target ごとに 3 layer を順に評価します:
+ccgate は target ごとに 3 layer を順に評価します。すべての layer は同じ merge セマンティクスで合成されます (後述「layer の合成ルール」参照):
 
-1. **埋込デフォルト**: バイナリに同梱。グローバル設定が無い場合のみ使用。`ccgate <target> init` で確認可能
-2. **グローバル設定**: 埋込デフォルトを**完全に置換** (merge しない):
+1. **埋込デフォルト**: バイナリに同梱。常にベースとして適用。`ccgate <target> init` で確認可能
+2. **グローバル設定**: 存在すれば埋込デフォルトの上に重ねる:
    - Claude Code: `~/.claude/ccgate.jsonnet`
    - Codex CLI:   `~/.codex/ccgate.jsonnet`
-3. **プロジェクトローカル**: 上記ベースに**追加** (append)。tracked file は無視される (後述「tracked file が無視される理由」):
+3. **プロジェクトローカル**: (1)+(2) の上に重ねる。tracked file は無視される (後述「tracked file が無視される理由」):
    - Claude Code: `{repo_root}/.claude/ccgate.local.jsonnet`
    - Codex CLI:   `{repo_root}/.codex/ccgate.local.jsonnet`
 
 `{repo_root}` は git repo root で、hook の `cwd` から `git rev-parse --show-toplevel` で解決します。git repo 外では `cwd` 自体が使われます。
 
 
-### 「置換」と「追加」の意味
+### layer の合成ルール
 
-グローバル設定が存在する場合、`provider` / `log_*` / `metrics_*` / `fallthrough_strategy` / `allow` / `deny` / `environment` は**全て**そこから取られます。埋込デフォルトは merge されないので、グローバル設定で `allow` を空にすると allow guidance が一切無い状態になります。
+| field 群 | merge 動作 | 例 |
+|---|---|---|
+| list: `allow` / `deny` / `environment` | 値を設定した layer が前の layer から引き継いだ list を **置き換える** (`[]` でも置換)。設定していない layer は前の値を保持 | embedded `allow: ["A","B"]` + global `allow: ["X"]` → 最終 `allow: ["X"]` |
+| list: `append_allow` / `append_deny` / `append_environment` | 値を設定した layer が前の layer の累積 list の **末尾に追加** | embedded `deny: ["A"]` + project `append_deny: ["P"]` → 最終 `deny: ["A","P"]` |
+| スカラー: `provider.*` / `log_*` / `metrics_*` / `fallthrough_strategy` | 各 layer が値を設定していれば per-field で **overwrite**、設定していなければ前の値を保持 | embedded `provider.model: "claude-haiku-4-5"` + global `provider: {model: "claude-sonnet-4-6"}` → 最終 `provider.model: "claude-sonnet-4-6"`、embedded の `provider.name` は生きたまま |
 
-プロジェクトローカル設定は常に**追加**です: `allow` / `deny` / `environment` はベースに concatenate、scalar field (`provider` / `log_*` / `metrics_*` / `fallthrough_strategy`) は overwrite。
+`allow` と `append_allow` (他 list も同じ) は同じ layer に共存可能 — 先に置換、その結果に対して append が積まれる。embedded の list を厳選版に **差し替えつつ** プロジェクト固有のルールを **追加** したいときに使います: `{ allow: ['only this base'], append_allow: ['plus this project rule'] }`。
 
-この非対称仕様は既知の課題で、refactor として [#38](https://github.com/tak848/ccgate/issues/38) で追跡しています。
+> v0.6 以前の ccgate はグローバル設定が存在すると埋込デフォルトをスキップしていました (グローバル層が「置換」していた)。v0.6 では embedded を常にベースとして適用しつつ、明示的な opt-in 拡張として `append_*` を導入しています。詳細は [#38](https://github.com/tak848/ccgate/issues/38) を参照。v0.6 以前のグローバル設定 (もともと `allow:` / `deny:` で完全置換していた) は無編集で同じ挙動になります。v0.6 以前のプロジェクトローカル設定で `allow:` / `deny:` / `environment:` を **追加** 目的で使っていた人だけ、`append_allow:` / `append_deny:` / `append_environment:` への rename が必要です (そのままだと累積 list を完全置換してしまいます)。
 
 ### tracked file が無視される理由
 
@@ -145,6 +149,6 @@ ccgate codex  metrics --days 7         # codex 側も同 shape
 ## 既知の制約
 
 - **Plan mode (Claude のみ) はプロンプト依存**: `permission_mode == "plan"` では (a) 実装系 write を拒絶する判定と (b) 明示的な allow guidance なしの read-only クエリ許可 を、LLM とシステムプロンプトの指示文に委ねています。どちらの方向にも誤判定の余地あり。[#37](https://github.com/tak848/ccgate/issues/37) で追跡
-- **layering 非対称**: global (置換) と project-local (追加) の差。前述「『置換』と『追加』の意味」参照。[#38](https://github.com/tak848/ccgate/issues/38) で追跡
+- **embedded default の特定ルールだけを部分削除する手段なし**: layer は list を **完全置換** (`allow: [...]`) するか **末尾追加** (`append_allow: [...]`) するかのどちらかで、embedded の中の 1 ルールだけ消したい場合は残り全部を `allow:` / `deny:` に書き直すしかない
 - **Codex hook は upstream で experimental**: hook schema が予告なく変更される可能性あり
 - **Codex `~/.codex/config.toml` 取り込み未実装** (`approval_policy`, `sandbox_mode`, `prefix_rules`): ccgate は hook payload + ccgate config だけで判定するため、Codex 自身の設定が拒絶するはずだった操作のシグナルは LLM に届かない (現状)

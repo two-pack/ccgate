@@ -292,6 +292,11 @@ func decide(ctx context.Context, cfg config.Config, in HookInput, ro runtimeOpti
 			return llm.Decision{}, false, llm.FallthroughKindUnknownProvider, "", nil, nil
 		}
 	}
+	// Trim whitespace so a templating mistake like `base_url: '   '`
+	// is treated as missing rather than passed through to the SDK,
+	// which would surface as a hard config error and exit 1 instead of
+	// quietly using the provider's default endpoint.
+	baseURL := strings.TrimSpace(cfg.Provider.BaseURL)
 
 	p, err := buildPrompt(cfg, in, ro)
 	if err != nil {
@@ -306,7 +311,7 @@ func decide(ctx context.Context, cfg config.Config, in HookInput, ro runtimeOpti
 		"user_message", redactedUserMessage(p.User),
 	)
 
-	client := newProviderClient(providerName, apiKey)
+	client := newProviderClient(providerName, apiKey, baseURL)
 	res, err := client.Decide(ctx, p)
 	if err != nil {
 		return llm.Decision{}, false, "", "", res.Usage, err
@@ -446,14 +451,14 @@ func resolveAPIKey(providerName string) (string, bool) {
 	return "", false
 }
 
-func newProviderClient(providerName, apiKey string) llm.Provider {
+func newProviderClient(providerName, apiKey, baseURL string) llm.Provider {
 	switch providerName {
 	case "openai":
-		return &openai.Client{APIKey: apiKey}
+		return &openai.Client{APIKey: apiKey, BaseURL: baseURL}
 	case "gemini":
-		return &gemini.Client{APIKey: apiKey}
+		return &gemini.Client{APIKey: apiKey, BaseURL: baseURL}
 	default: // anthropic
-		return &anthropic.Client{APIKey: apiKey}
+		return &anthropic.Client{APIKey: apiKey, BaseURL: baseURL}
 	}
 }
 

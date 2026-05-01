@@ -16,6 +16,10 @@
         "model": {
           "type": "string"
         },
+        "base_url": {
+          "type": "string",
+          "description": "Override the provider's API base URL. Empty (default) uses the SDK default endpoint. Use this to route through an OpenAI- or Anthropic-compatible proxy (LiteLLM proxy, Azure OpenAI, on-prem gateway, regional endpoint, ...). For OpenAI-compatible endpoints include the `/v1` path; for Anthropic-compatible endpoints stop at the host root (the SDK appends `/v1/messages`)."
+        },
         "timeout_ms": {
           "type": "integer",
           "minimum": 0,

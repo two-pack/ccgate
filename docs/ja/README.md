@@ -136,6 +136,8 @@ ccgate claude init > ~/.claude/ccgate.jsonnet
 | `openai`        | `CCGATE_OPENAI_API_KEY`    | `OPENAI_API_KEY`      | <https://platform.openai.com/api-keys>      |
 | `gemini`        | `CCGATE_GEMINI_API_KEY`    | `GEMINI_API_KEY`      | <https://aistudio.google.com/app/api-keys>  |
 
+OpenAI 互換 / Anthropic 互換 proxy (LiteLLM proxy, Azure OpenAI, オンプレ gateway 等) を経由したい場合は、`provider.base_url` を設定して対応する native provider を使います — 詳細は [互換 proxy 経由で叩く](#互換-proxy-経由で叩く) を参照。
+
 ## セットアップ — Codex CLI (experimental)
 
 > Codex hooks は upstream で experimental 扱いです。スキーマや挙動が今後変わる可能性があります。
@@ -207,9 +209,10 @@ Claude Code と同じ環境変数を使います — [provider table](#3-api-キ
 3 つの layer はすべて同じ merge ルールで合成されます:
 
 - **list**: `allow` / `deny` / `environment` は値を設定した layer が前の layer から引き継いだ list を **置き換える** (`[]` を書けば空 list に置き換え)。`append_*` 系 (`append_allow` / `append_deny` / `append_environment`) は前の layer の累積 list の **末尾に追加** する。
-- **スカラー**: `provider.*` / `log_*` / `metrics_*` / `fallthrough_strategy` はその layer がフィールドを設定していれば per-field で上書き、設定していなければ前の値を保持。
+- **スカラー**: `log_*` / `metrics_*` / `fallthrough_strategy` はその layer がフィールドを設定していれば per-field で上書き、設定していなければ前の値を保持。
+- **`provider` block**: `provider` を書いた layer は block 全体 (`name` + `model` + `base_url` + `timeout_ms`) を **丸ごと置換**。書かなかった layer は前の block をそのまま継承。`name` を切り替えると `model` の名前空間も `base_url` も意味が変わる密結合なので、per-field merge にすると下位 layer の値が残って壊れるため block 単位で扱う。
 
-`~/.<target>/ccgate.jsonnet` で `provider.model` だけ書き換えれば embedded の `allow` / `deny` はそのまま残ります。`allow: [...]` を書けば embedded の allow を完全に差し替え (これは v0.6 以前のグローバル設定がすでに行っていた挙動なので、そのまま冪等)。プロジェクトローカル設定は典型的に `append_deny: [...]` / `append_environment: [...]` で追加制限を載せます。
+`~/.<target>/ccgate.jsonnet` で model だけ変えたい場合でも `provider: {name: 'anthropic', model: 'claude-sonnet-4-6'}` のように block 全体を書き直す必要があります (embedded の `allow` / `deny` はそのまま残ります)。`allow: [...]` を書けば embedded の allow を完全に差し替え (これは v0.6 以前のグローバル設定がすでに行っていた挙動なので、そのまま冪等)。プロジェクトローカル設定は典型的に `append_deny: [...]` / `append_environment: [...]` で追加制限を載せます。
 プロジェクトローカル設定は **Git に追跡されていないファイルのみ** 読み込まれます。
 
 
@@ -218,7 +221,8 @@ Claude Code と同じ環境変数を使います — [provider table](#3-api-キ
 | フィールド               | 型                                | デフォルト                                                                       | 説明                                                                                                       |
 |--------------------------|-----------------------------------|---------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------|
 | `provider.name`          | string                            | `"anthropic"`                                                                   | プロバイダー名。`"anthropic"` / `"openai"` / `"gemini"` のいずれか                                          |
-| `provider.model`         | string                            | `"claude-haiku-4-5"`                                                            | モデル名。例: `claude-haiku-4-5` / `claude-sonnet-4-6` (anthropic)、`gpt-5.4-nano-2026-03-17` (openai)、`gemini-3-flash-preview` (gemini) |
+| `provider.model`         | string                            | `"claude-haiku-4-5"`                                                            | モデル名。例: `claude-haiku-4-5` / `claude-sonnet-4-6` (anthropic)、`gpt-5.4-nano-2026-03-17` (openai)、`gemini-3-flash-preview` (gemini)。互換 proxy 経由なら proxy が公開している任意の名前 (例: `anthropic/claude-haiku-4-5`) |
+| `provider.base_url`      | string                            | `""`                                                                            | API base URL の上書き。空文字列 (default) で SDK の既定 endpoint を使用。OpenAI 互換 / Anthropic 互換 proxy (LiteLLM proxy, Azure OpenAI, オンプレ gateway, 地域別 endpoint 等) 経由で叩きたい時に指定 |
 | `provider.timeout_ms`    | int                               | `20000`                                                                         | API タイムアウト (ms)。`0` = タイムアウトなし                                                              |
 | `log_path`               | string                            | `$XDG_STATE_HOME/ccgate/<target>/ccgate.log`                                    | ログファイルパス。`~` でホームディレクトリ展開                                                             |
 | `log_disabled`           | bool                              | `false`                                                                         | ログ出力を完全に無効化                                                                                     |
@@ -250,6 +254,46 @@ Claude Code と同じ環境変数を使います — [provider table](#3-api-キ
 ```
 
 対応する API キー (`CCGATE_OPENAI_API_KEY` / `CCGATE_GEMINI_API_KEY` — [provider table](#3-api-キー)) を export してください。キーが見つからない場合 ccgate は上流ツールの確認画面に fallthrough するため、provider 切替で hook が壊れることはありません。
+
+### 互換 proxy 経由で叩く
+
+ccgate は Anthropic / OpenAI クライアントが使うのと同じ chat completions API を喋るので、**OpenAI 互換 / Anthropic 互換**の任意の endpoint — [LiteLLM proxy](https://docs.litellm.ai/docs/proxy/quick_start), Azure OpenAI, オンプレ gateway, 地域別 endpoint など — に対して動きます。proxy が話すプロトコルに合わせて `provider.base_url` を設定します。
+
+`provider.base_url` は underlying SDK の `WithBaseURL` にそのまま渡されるので、書く path は **その SDK の慣習**に従います (ccgate 側で正規化しません):
+
+| `provider.name` | underlying SDK | default base URL                  | `base_url` に書く形              |
+|-----------------|----------------|-----------------------------------|----------------------------------|
+| `openai`        | `openai-go`    | `https://api.openai.com/v1/`      | host **+ `/v1`** (SDK が `chat/completions` を追加) |
+| `anthropic`     | `anthropic-sdk-go` | `https://api.anthropic.com/` | host root のみ (SDK が `/v1/messages` を追加) |
+| `gemini`        | Gemini の OpenAI 互換 endpoint 経由で `openai-go` | `https://generativelanguage.googleapis.com/v1beta/openai/` | override する場合は host **+ `/v1beta/openai`** |
+
+**OpenAI 互換 endpoint** (LiteLLM proxy の `/v1/chat/completions` 等):
+
+```jsonnet
+{
+  provider: {
+    name: 'openai',
+    model: 'anthropic/claude-haiku-4-5', // proxy が公開している名前
+    base_url: 'https://your-proxy.example/v1',
+  },
+}
+```
+
+proxy の API キーを `CCGATE_OPENAI_API_KEY` で export。OpenAI SDK は base URL に `/chat/completions` を直接 append するので、末尾の `/v1` が必要。
+
+**Anthropic 互換 endpoint** (LiteLLM proxy の `/v1/messages` 等):
+
+```jsonnet
+{
+  provider: {
+    name: 'anthropic',
+    model: 'claude-haiku-4-5',
+    base_url: 'https://your-proxy.example',
+  },
+}
+```
+
+proxy の API キーを `CCGATE_ANTHROPIC_API_KEY` で export。Anthropic SDK が `/v1/messages` を自分で append するので、base URL は host root で止めます。
 
 ## デフォルトルール
 

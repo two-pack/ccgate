@@ -71,8 +71,20 @@ func (c Config) GetFallthroughStrategy() string {
 }
 
 type ProviderConfig struct {
-	Name      string `json:"name"`
-	Model     string `json:"model"`
+	Name  string `json:"name"`
+	Model string `json:"model"`
+	// BaseURL is passed verbatim to the underlying SDK's WithBaseURL.
+	// ccgate does NOT normalize the path — each SDK has its own
+	// convention for what the base URL should include:
+	//   - openai-go     defaults to "https://api.openai.com/v1/" and
+	//                   appends "chat/completions" relative to it, so
+	//                   overrides must include the "/v1" segment
+	//                   (e.g. "https://my-proxy/v1").
+	//   - anthropic-sdk-go defaults to "https://api.anthropic.com/" and
+	//                   appends "v1/messages" itself, so overrides
+	//                   stop at the host root (e.g. "https://my-proxy").
+	// Empty value uses the SDK default.
+	BaseURL   string `json:"base_url,omitempty"`
 	TimeoutMS *int   `json:"timeout_ms,omitempty"`
 }
 
@@ -363,14 +375,18 @@ func mergeConfigJSON(data string, cfg *Config) error {
 		return fmt.Errorf("unmarshal config: %w", err)
 	}
 
-	if override.Provider.Name != "" {
-		cfg.Provider.Name = override.Provider.Name
+	// `provider` is a tightly-coupled block: name / model / base_url /
+	// timeout_ms describe one provider together, and per-field merge
+	// across layers produces incoherent combinations (e.g. a higher
+	// layer switching `name` while a lower layer's `base_url` for a
+	// different proxy stays stuck). When a layer specifies `provider`,
+	// replace the block atomically.
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(data), &keys); err != nil {
+		return fmt.Errorf("unmarshal config keys: %w", err)
 	}
-	if override.Provider.Model != "" {
-		cfg.Provider.Model = override.Provider.Model
-	}
-	if override.Provider.TimeoutMS != nil {
-		cfg.Provider.TimeoutMS = override.Provider.TimeoutMS
+	if _, ok := keys["provider"]; ok {
+		cfg.Provider = override.Provider
 	}
 	if override.LogPath != "" {
 		cfg.LogPath = override.LogPath

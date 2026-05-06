@@ -8,9 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	anthropic "github.com/anthropics/anthropic-sdk-go"
 	jsonnet "github.com/google/go-jsonnet"
+	"github.com/google/go-jsonnet/ast"
+	"github.com/invopop/jsonschema"
+	orderedmap "github.com/wk8/go-ordered-map/v2"
 
 	"github.com/tak848/ccgate/internal/gitutil"
 	"github.com/tak848/ccgate/internal/llm"
@@ -24,6 +28,30 @@ const (
 	DefaultMetricsMaxSize = 2 * 1024 * 1024 // 2MB
 	BaseConfigName        = "ccgate.jsonnet"
 	LocalConfigName       = "ccgate.local.jsonnet"
+
+	// DefaultAuthRefreshMarginMS is the early-refresh slack used when
+	// deciding whether a cached helper credential is still valid:
+	// `now + margin < expires_at` keeps the cache, anything else
+	// triggers a refresh. 60 seconds is comfortably larger than the
+	// default `provider.timeout_ms` (20 000 ms = 20s) so a cached
+	// credential will not race the next API call.
+	DefaultAuthRefreshMarginMS = 60_000
+	// DefaultAuthTimeoutMS caps one Resolve call. 30 seconds covers
+	// AWS STS, gcloud auth print-access-token, and an internal SSO
+	// key broker that opens a browser on first run; bump it higher
+	// (e.g. 120 000) if your helper takes longer.
+	DefaultAuthTimeoutMS = 30_000
+
+	// AuthTypeExec / AuthTypeFile are the AuthConfig.Type values.
+	AuthTypeExec = "exec"
+	AuthTypeFile = "file"
+
+	// AuthShellBash / AuthShellPowerShell are the accepted
+	// AuthConfig.Shell values, mirroring the Claude Code hook
+	// `shell` field. AuthShellBash is the default when Shell is
+	// empty (matching Claude Code's bash default).
+	AuthShellBash       = "bash"
+	AuthShellPowerShell = "powershell"
 )
 
 // FallthroughStrategy* aliases re-export the canonical values from
@@ -35,6 +63,12 @@ const (
 )
 
 type Config struct {
+	// Schema is the editor `$schema` pointer the embedded defaults
+	// (and most users) write at the top of their jsonnet so an IDE
+	// can validate the config. ccgate ignores it at runtime; the
+	// field exists only to satisfy DisallowUnknownFields without
+	// special-casing the key name in the merger.
+	Schema              string         `json:"$schema,omitempty"`
 	Provider            ProviderConfig `json:"provider"`
 	LogPath             string         `json:"log_path,omitempty"`
 	LogDisabled         *bool          `json:"log_disabled,omitempty"`
@@ -84,8 +118,45 @@ type ProviderConfig struct {
 	//                   appends "v1/messages" itself, so overrides
 	//                   stop at the host root (e.g. "https://my-proxy").
 	// Empty value uses the SDK default.
-	BaseURL   string `json:"base_url,omitempty"`
-	TimeoutMS *int   `json:"timeout_ms,omitempty"`
+	BaseURL string `json:"base_url,omitempty"`
+	// Auth selects an alternative credential source for the provider.
+	// When nil, ccgate reads the credential from the regular env vars
+	// (`$CCGATE_<PROVIDER>_API_KEY` then `$<PROVIDER>_API_KEY`). When
+	// set, env-var fallback is disabled — a misbehaving helper / file
+	// surfaces as `credential_unavailable` instead of silently going
+	// back to env, which would mask configuration errors.
+	//
+	// See AuthConfig for the discriminated union of credential
+	// sources (`type=exec` shell helper, `type=file` rotator file).
+	Auth      *AuthConfig `json:"auth,omitempty"`
+	TimeoutMS *int        `json:"timeout_ms,omitempty"`
+}
+
+// AuthConfig is the discriminated union for short-lived / rotating
+// credentials. Type selects the branch; validate rejects fields set
+// on the wrong branch. See docs/api-key-helper.md for the full
+// reference (output formats, caching rules, examples).
+type AuthConfig struct {
+	// Type discriminates: AuthTypeExec or AuthTypeFile.
+	Type string `json:"type"`
+	// Shell selects bash (default) or powershell for type=exec; see
+	// keystore.shellInvocation for the launch details.
+	Shell string `json:"shell,omitempty"`
+	// Command is the shell command for type=exec.
+	Command string `json:"command,omitempty"`
+	// Path is the file path for type=file. nil = use the per-target
+	// default; an empty pointer is rejected.
+	Path *string `json:"path,omitempty"`
+	// RefreshMarginMS is the early-refresh slack in milliseconds
+	// (default 60 000). >= 0; 0 disables the guard.
+	RefreshMarginMS *int `json:"refresh_margin_ms,omitempty"`
+	// TimeoutMS bounds one Resolve call: lock + helper exec for
+	// type=exec, file read for type=file (default 30 000). > 0.
+	TimeoutMS *int `json:"timeout_ms,omitempty"`
+	// CacheKey is a secret-free salt for the cache fingerprint
+	// (type=exec only). Used as-is; pull env values via jsonnet
+	// std.native('env') / must_env when you need them.
+	CacheKey string `json:"cache_key,omitempty"`
 }
 
 // GetTimeoutMS returns the timeout in milliseconds.
@@ -96,6 +167,79 @@ func (p ProviderConfig) GetTimeoutMS() int {
 	}
 	return *p.TimeoutMS
 }
+
+// GetRefreshMargin returns the refresh margin as a time.Duration,
+// falling back to DefaultAuthRefreshMarginMS when unset. Validation
+// guarantees the value is non-negative, so this method never returns
+// a negative duration.
+func (a AuthConfig) GetRefreshMargin() time.Duration {
+	ms := DefaultAuthRefreshMarginMS
+	if a.RefreshMarginMS != nil {
+		ms = *a.RefreshMarginMS
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// GetTimeout returns the helper-exec timeout as a time.Duration,
+// falling back to DefaultAuthTimeoutMS when unset. Validation
+// guarantees a positive value so this method never returns 0 for an
+// auth.type=exec config that reached the runner.
+func (a AuthConfig) GetTimeout() time.Duration {
+	ms := DefaultAuthTimeoutMS
+	if a.TimeoutMS != nil {
+		ms = *a.TimeoutMS
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// JSONSchema implements jsonschema.customSchemaImpl so the generated
+// schemas/{claude,codex}.schema.json present `provider.auth` as a
+// `oneOf` over the `type=exec` and `type=file` branches, mirroring
+// the validate() rules (required field per type, additionalProperties
+// false). Editor users get the same mutual-exclusion feedback that
+// runtime validate would give them at hook fire time.
+func (AuthConfig) JSONSchema() *jsonschema.Schema {
+	return &jsonschema.Schema{
+		Title:       "auth",
+		Description: "Discriminated union selecting the credential source for the provider.",
+		OneOf: []*jsonschema.Schema{
+			authExecBranchSchema(),
+			authFileBranchSchema(),
+		},
+	}
+}
+
+func authExecBranchSchema() *jsonschema.Schema {
+	props := orderedmap.New[string, *jsonschema.Schema]()
+	props.Set("type", &jsonschema.Schema{Type: "string", Const: AuthTypeExec})
+	props.Set("command", &jsonschema.Schema{Type: "string", MinLength: ptr(uint64(1)), Description: "Shell command. Stdout is the credential. Run via the configured shell (default bash)."})
+	props.Set("shell", &jsonschema.Schema{Type: "string", Enum: []any{AuthShellBash, AuthShellPowerShell}, Description: "Shell that runs `command`. \"bash\" runs `bash -c <command>`. \"powershell\" runs `pwsh -Command <command>` when pwsh is on PATH (PowerShell 7+, cross-platform) and falls back to `powershell -Command <command>` (Windows PowerShell 5.1) otherwise. Default: bash."})
+	props.Set("refresh_margin_ms", &jsonschema.Schema{Type: "integer", Minimum: json.Number("0"), Description: "Cache early-refresh threshold + minimum remaining TTL guard for fresh credentials, in milliseconds. Default: 60000."})
+	props.Set("timeout_ms", &jsonschema.Schema{Type: "integer", Minimum: json.Number("1"), Description: "Hard cap on one Resolve call (lock + helper exec), in milliseconds. Default: 30000."})
+	props.Set("cache_key", &jsonschema.Schema{Type: "string", Description: "Secret-free salt added to the cache fingerprint so a single command string can produce per-account cache entries (used as-is; pull env values via jsonnet std.native('env') / std.native('must_env'))."})
+	return &jsonschema.Schema{
+		Type:                 "object",
+		Required:             []string{"type", "command"},
+		Properties:           props,
+		AdditionalProperties: jsonschema.FalseSchema,
+	}
+}
+
+func authFileBranchSchema() *jsonschema.Schema {
+	props := orderedmap.New[string, *jsonschema.Schema]()
+	props.Set("type", &jsonschema.Schema{Type: "string", Const: AuthTypeFile})
+	props.Set("path", &jsonschema.Schema{Type: "string", MinLength: ptr(uint64(1)), Description: "Path to the credential file. Absolute, ~/-prefixed, or relative (relative paths resolve from the hook's working directory at fire time, not the config file's directory). Omit the field to use the default $XDG_STATE_HOME/ccgate/<target>/auth_key.json; do not set it to an empty string."})
+	props.Set("refresh_margin_ms", &jsonschema.Schema{Type: "integer", Minimum: json.Number("0"), Description: "Minimum remaining TTL guard for file output, in milliseconds. Default: 60000."})
+	props.Set("timeout_ms", &jsonschema.Schema{Type: "integer", Minimum: json.Number("1"), Description: "Hard cap on the file read so a stalled mount surfaces as reason=timeout. Default: 30000."})
+	return &jsonschema.Schema{
+		Type:                 "object",
+		Required:             []string{"type"},
+		Properties:           props,
+		AdditionalProperties: jsonschema.FalseSchema,
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
 
 // Default returns a Config seeded with the provider/log/metrics
 // defaults common to every target. LogPath / MetricsPath are left
@@ -115,8 +259,9 @@ func Default() Config {
 	}
 }
 
-func intPtr(v int) *int       { return &v }
-func int64Ptr(v int64) *int64 { return &v }
+func intPtr(v int) *int          { return &v }
+func int64Ptr(v int64) *int64    { return &v }
+func stringPtr(v string) *string { return &v }
 
 // GetTimeoutMS returns the provider timeout in milliseconds.
 // nil defaults to DefaultTimeoutMS.
@@ -238,6 +383,13 @@ func StateDir(sub string) string {
 	return filepath.Join(stateDir(), sub)
 }
 
+// DefaultAuthPath is the path ccgate uses for `auth.type=file` when
+// the config leaves `auth.path` empty: a single per-target file
+// under StateDir.
+func DefaultAuthPath(target string) string {
+	return filepath.Join(StateDir(target), "auth_key.json")
+}
+
 // Load composes the runtime config from three layers, all using the
 // same merge semantics:
 //
@@ -246,7 +398,10 @@ func StateDir(sub string) string {
 //   - lists `append_allow` / `append_deny` / `append_environment` ADD
 //     onto the carried-over value (can coexist with the replace-mode
 //     field; replace runs first, append stacks),
-//   - scalars (`provider.*` / `log_*` / `metrics_*` /
+//   - the `provider` block is replaced atomically as a unit (see
+//     mergeConfigJSON below) — its sub-fields do NOT merge per
+//     field across layers,
+//   - the remaining scalars (`log_*` / `metrics_*` /
 //     `fallthrough_strategy`) overwrite per-field when set.
 //
 // Layers, applied in order:
@@ -344,9 +499,59 @@ func safeProjectLocalConfigPaths(cwd string, relativePaths []string) []string {
 	return safe
 }
 
-func mergeConfigFile(path string, cfg *Config) error {
+// newJsonnetVM returns a jsonnet VM with ccgate's host-language
+// extensions registered. The same VM shape is used by every entry
+// point that evaluates jsonnet (file or string), so adding a new
+// helper happens in one place and stays consistent across global /
+// project / embedded layers.
+//
+// `std.native('env')(name)` returns os.Getenv(name), defaulting to an
+// empty string for undefined variables (permissive). Use this when a
+// config value should fall back to literal defaults when the env is
+// not set.
+//
+// `std.native('must_env')(name)` returns os.Getenv(name) but raises a
+// jsonnet evaluation error when the variable is unset, so misconfig
+// surfaces at config load time instead of being silently empty. This
+// is the strict variant for places where an unset env means "broken
+// config".
+//
+// Pattern follows ecspresso v2.4+ — both functions are documented in
+// docs/api-key-helper.md so users know they can use them in any
+// string field, not just `auth.cache_key`.
+func newJsonnetVM() *jsonnet.VM {
 	vm := jsonnet.MakeVM()
-	data, err := vm.EvaluateFile(path)
+	vm.NativeFunction(&jsonnet.NativeFunction{
+		Name:   "env",
+		Params: ast.Identifiers{"name"},
+		Func: func(args []any) (any, error) {
+			name, ok := args[0].(string)
+			if !ok {
+				return nil, fmt.Errorf("env: expected string name, got %T", args[0])
+			}
+			return os.Getenv(name), nil
+		},
+	})
+	vm.NativeFunction(&jsonnet.NativeFunction{
+		Name:   "must_env",
+		Params: ast.Identifiers{"name"},
+		Func: func(args []any) (any, error) {
+			name, ok := args[0].(string)
+			if !ok {
+				return nil, fmt.Errorf("must_env: expected string name, got %T", args[0])
+			}
+			v, ok := os.LookupEnv(name)
+			if !ok {
+				return nil, fmt.Errorf("must_env: undefined env var %q", name)
+			}
+			return v, nil
+		},
+	})
+	return vm
+}
+
+func mergeConfigFile(path string, cfg *Config) error {
+	data, err := newJsonnetVM().EvaluateFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return os.ErrNotExist
@@ -361,8 +566,7 @@ func mergeConfigFile(path string, cfg *Config) error {
 }
 
 func mergeConfigString(snippet string, cfg *Config) error {
-	vm := jsonnet.MakeVM()
-	data, err := vm.EvaluateAnonymousSnippet("defaults.jsonnet", snippet)
+	data, err := newJsonnetVM().EvaluateAnonymousSnippet("defaults.jsonnet", snippet)
 	if err != nil {
 		return fmt.Errorf("evaluate jsonnet snippet: %w", err)
 	}
@@ -370,17 +574,26 @@ func mergeConfigString(snippet string, cfg *Config) error {
 }
 
 func mergeConfigJSON(data string, cfg *Config) error {
+	// Reject any field the Config struct does not declare. encoding/json
+	// would otherwise drop unknown keys silently, so a typo like
+	// `mdoel:` or `api_key_commnd:` would leave the user wondering
+	// why their value is being ignored. DisallowUnknownFields is a
+	// uniform check — no special-casing per field, no fictional
+	// "migrate from X" messages — so the report is the same shape
+	// regardless of which key was wrong.
+	dec := json.NewDecoder(strings.NewReader(data))
+	dec.DisallowUnknownFields()
 	var override Config
-	if err := json.Unmarshal([]byte(data), &override); err != nil {
+	if err := dec.Decode(&override); err != nil {
 		return fmt.Errorf("unmarshal config: %w", err)
 	}
 
 	// `provider` is a tightly-coupled block: name / model / base_url /
-	// timeout_ms describe one provider together, and per-field merge
-	// across layers produces incoherent combinations (e.g. a higher
-	// layer switching `name` while a lower layer's `base_url` for a
-	// different proxy stays stuck). When a layer specifies `provider`,
-	// replace the block atomically.
+	// timeout_ms / auth describe one provider together, and per-field
+	// merge across layers produces incoherent combinations (e.g. a
+	// higher layer switching `name` while a lower layer's `base_url`
+	// for a different proxy stays stuck). When a layer specifies
+	// `provider`, replace the block atomically.
 	var keys map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(data), &keys); err != nil {
 		return fmt.Errorf("unmarshal config keys: %w", err)

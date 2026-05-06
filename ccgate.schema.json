@@ -20,6 +20,72 @@
           "type": "string",
           "description": "Override the provider's API base URL. Empty (default) uses the SDK default endpoint. Use this to route through an OpenAI- or Anthropic-compatible proxy (LiteLLM proxy, Azure OpenAI, on-prem gateway, regional endpoint, ...). For OpenAI-compatible endpoints include the `/v1` path; for Anthropic-compatible endpoints stop at the host root (the SDK appends `/v1/messages`)."
         },
+        "auth": {
+          "description": "Discriminated union selecting the credential source for the provider. See docs/api-key-helper.md for the full helper contract, examples, and recovery checklist.",
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["type", "command"],
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "exec"
+                },
+                "command": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Shell command whose stdout is the API key. Run via the configured `shell` (default bash). JSON `{\"key\":\"...\",\"expires_at\":\"<RFC3339>\"}` is parsed strictly and memoized to a per-target cache file (early-refreshed via `refresh_margin_ms`). Plain non-JSON stdout is returned uncached and must be a single non-empty line."
+                },
+                "shell": {
+                  "type": "string",
+                  "enum": ["bash", "powershell"],
+                  "description": "Shell that runs `command`. `bash` runs `bash -c <command>`. `powershell` runs `pwsh -Command <command>` when pwsh is on PATH (PowerShell 7+, cross-platform) and falls back to `powershell -Command <command>` (Windows PowerShell 5.1) otherwise. Default: bash."
+                },
+                "refresh_margin_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "Cache early-refresh threshold + minimum remaining TTL guard for fresh credentials, in milliseconds. Cache entries are stale once `now + margin >= expires_at`, forcing a helper refresh. Must be `>= 0`; `0` disables the guard. Default: 60000."
+                },
+                "timeout_ms": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Hard cap on one Resolve call (lock retries + helper exec), in milliseconds. Must be `> 0`. Default: 30000."
+                },
+                "cache_key": {
+                  "type": "string",
+                  "description": "Secret-free salt added to the cache fingerprint so an env / profile dependent helper (e.g. `aws sts ... --profile prod`) gets a separate cache file per profile. The value is used as-is; pull live env values in via the jsonnet `std.native('env')` / `std.native('must_env')` helpers."
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["type"],
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "file"
+                },
+                "path": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Path to a file whose contents follow the same JSON / plain-string shape as the exec branch. Absolute, `~/`-prefixed, and relative paths are all accepted; relative paths resolve from the hook's working directory at fire time (not the directory of the config file). Omit the field to use the default $XDG_STATE_HOME/ccgate/<target>/auth_key.json; do not set it to an empty string. Read every hook fire (no caching)."
+                },
+                "refresh_margin_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "Minimum remaining TTL guard for the file's `expires_at`, in milliseconds: a credential about to expire surfaces as `expired` instead of being handed to the SDK. `>= 0`; default 60000."
+                },
+                "timeout_ms": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Hard cap on the file read so a stalled mount surfaces as reason=timeout, in milliseconds. `> 0`; default 30000."
+                }
+              }
+            }
+          ]
+        },
         "timeout_ms": {
           "type": "integer",
           "minimum": 0,
@@ -41,7 +107,7 @@
     },
     "log_path": {
       "type": "string",
-      "description": "Log file path. Supports ~ for home directory. Default: $XDG_STATE_HOME/ccgate/ccgate.log"
+      "description": "Log file path. Supports ~ for home directory. Default: $XDG_STATE_HOME/ccgate/<target>/ccgate.log (target = claude / codex)."
     },
     "log_disabled": {
       "type": "boolean",
@@ -54,7 +120,7 @@
     },
     "metrics_path": {
       "type": "string",
-      "description": "Metrics JSONL file path. Default: $XDG_STATE_HOME/ccgate/metrics.jsonl"
+      "description": "Metrics JSONL file path. Default: $XDG_STATE_HOME/ccgate/<target>/metrics.jsonl (target = claude / codex)."
     },
     "metrics_disabled": {
       "type": "boolean",
@@ -75,6 +141,27 @@
       "items": {
         "type": "string"
       }
+    },
+    "append_allow": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Allow guidance rules appended on top of the carried-over list (instead of replacing it). Typically used in project-local configs."
+    },
+    "append_deny": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Deny guidance rules appended on top of the carried-over list."
+    },
+    "append_environment": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Environment context appended on top of the carried-over list."
     }
   }
 }

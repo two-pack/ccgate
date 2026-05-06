@@ -9,8 +9,8 @@ AI コーディングツール向けの **PermissionRequest** フックです。
 
 対応ターゲット:
 
-- **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** — 安定
-- **[OpenAI Codex CLI](https://developers.openai.com/codex/hooks)** — experimental
+- **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)**
+- **[OpenAI Codex CLI](https://developers.openai.com/codex/hooks)**
 
 [English README](../../README.md)
 
@@ -36,13 +36,13 @@ ccgate
 
 ```
 ccgate                         stdin から HookInput JSON を読み込む (Claude Code hook)。
-                               'ccgate claude' と等価。**永続的なデフォルト挙動** で、deprecation 予定なし。
+                               'ccgate claude' と等価。**今後も維持されるデフォルト挙動** で、廃止予定はありません。
                                既存の ~/.claude/settings.json の "command": "ccgate" 設定はそのまま動作し続ける。
 ccgate claude                  bare ccgate と完全等価 (新規ユーザー向け推奨表記)
 ccgate claude init [-p|-o|-f]  Claude Code 用の埋込デフォルトを出力
 ccgate claude metrics [...]    Claude Code のメトリクス集計
 
-ccgate codex                   stdin から HookInput JSON を読み込む (Codex CLI hook、experimental)
+ccgate codex                   stdin から HookInput JSON を読み込む (Codex CLI hook)
 ccgate codex init [-o|-f]      Codex CLI 用の埋込デフォルトを出力
 ccgate codex metrics [...]     Codex CLI のメトリクス集計
 ```
@@ -94,13 +94,29 @@ go install github.com/tak848/ccgate@latest
 
 ccgate はデフォルトの安全ルールを内蔵しているため、設定ファイルなしでも動作します。
 
-カスタマイズする場合:
+カスタマイズはどちらのレイヤーでもできます。両方とも同じ merge ルールに従います。
 
-```bash
-ccgate claude init > ~/.claude/ccgate.jsonnet
-```
+- `~/.claude/ccgate.jsonnet` — Claude Code セッション全体に効くグローバル設定
+- `<repo>/.claude/ccgate.local.jsonnet` — プロジェクトローカル設定 (Git 未追跡のみ、詳細は [configuration.md](configuration.md#ccgate-が-config-を探す場所))。グローバル設定の上にさらに重なります
 
-`$schema` フィールドで [`schemas/claude.schema.json`](../../schemas/claude.schema.json) を参照しているため、エディタ補完が効きます。
+どちらのファイルでも、次の 2 種類のいずれか (もしくは両方) を書けます。
+
+- **継承した list に追加する** (`append_allow` / `append_deny` / `append_environment`): 組み込みデフォルト + これまでのレイヤーに乗ったまま、ccgate が今後リリースで品質改善したルールも自動で取り込まれます。
+
+  ```jsonnet
+  {
+    ['$schema']: 'https://raw.githubusercontent.com/tak848/ccgate/main/schemas/claude.schema.json',
+    append_deny: [
+      'Production database access: any psql / mysql connection to a *.prod.* host. deny_message: production access is gated behind the runbook.',
+    ],
+  }
+  ```
+
+- **継承した list を丸ごと置き換える** (`allow:` / `deny:` を直接書く): 細部まで自分で握ります。今後 ccgate がデフォルトを更新したときに、自分の `allow` / `deny` を新デフォルトと突き合わせて取り込むかどうかは都度自分で判断する必要があります。`ccgate claude init | less` で組み込みデフォルトの中身を確認できます。
+
+典型的な使い分けは、グローバル設定を組み込みデフォルトに近づけておき (個人的な好みは `append_deny` だけにする等)、プロジェクト固有の制約はプロジェクトローカル側に置く形です。2 つのレイヤーは独立しており、グローバルが list を置き換えていてもプロジェクトローカルで `append_*` を重ねられますし、その逆も可能です。
+
+`$schema` 行はどちらの形でもエディタ補完を有効にします。
 
 ### 2. Claude Code の hooks に登録
 
@@ -138,19 +154,28 @@ ccgate claude init > ~/.claude/ccgate.jsonnet
 | `openai`        | `CCGATE_OPENAI_API_KEY`    | `OPENAI_API_KEY`      | <https://platform.openai.com/api-keys>      |
 | `gemini`        | `CCGATE_GEMINI_API_KEY`    | `GEMINI_API_KEY`      | <https://aistudio.google.com/app/api-keys>  |
 
-OpenAI 互換 / Anthropic 互換 proxy (LiteLLM proxy, Azure OpenAI, オンプレ gateway 等) を経由したい場合は、`provider.base_url` を設定して対応する native provider を使います — 詳細は [互換 proxy 経由で叩く](#互換-proxy-経由で叩く) を参照。
+OpenAI 互換 / Anthropic 互換 proxy (LiteLLM proxy, Azure OpenAI, オンプレ gateway 等) を経由したい場合は、`provider.base_url` を設定して対応する native provider を使います — 詳細は [互換 proxy 経由で利用する](#互換-proxy-経由で利用する) を参照。
 
-## セットアップ — Codex CLI (experimental)
+## セットアップ — Codex CLI
 
-> Codex hooks は upstream で experimental 扱いです。スキーマや挙動が今後変わる可能性があります。
+> Codex hooks 自体が upstream で experimental 扱いで、`features.codex_hooks = true` flag 配下にあり、schema が今後変わる可能性があります。特定 field に依存する前に [Codex hooks docs](https://developers.openai.com/codex/hooks) を一次情報として確認してください。
 
 ### 1. 設定ファイルを配置 (オプション)
 
-```bash
-ccgate codex init > ~/.codex/ccgate.jsonnet
+ccgate は Codex 側にもデフォルト設定を内蔵しています。Claude 側と同じ merge ルールで、`~/.codex/ccgate.jsonnet` (グローバル) と `<repo>/.codex/ccgate.local.jsonnet` (プロジェクトローカル、Git 未追跡のみ) のどちらでも、`append_*` で継承した list に追加することも、`allow:` / `deny:` で丸ごと置き換えることもできます。
+
+```jsonnet
+{
+  ['$schema']: 'https://raw.githubusercontent.com/tak848/ccgate/main/schemas/codex.schema.json',
+  append_deny: [
+    'Production database access: any psql / mysql connection to a *.prod.* host. deny_message: production access is gated behind the runbook.',
+  ],
+}
 ```
 
-defaults は Claude Code と同じ思想 (allow + deny + environment)。Codex hooks は Bash、`apply_patch`、MCP tool 呼び出しなど複数の tool surface で発火し、ccgate のルールは全 surface を対象にしています。system prompt は LLM に「`tool_name` + `tool_input` の JSON 全体を見て分類せよ」と指示します。
+`ccgate codex init | less` で組み込みデフォルトの中身を確認できます (置き換える前提なら参考にしてください)。
+
+デフォルト設定は Claude Code と同じ方針 (allow + deny + environment) です。Codex hooks は Bash、`apply_patch`、MCP tool 呼び出しなど複数種類の tool で発火し、ccgate のルールはそれらすべてを対象にします。system prompt は LLM に「`tool_name` + `tool_input` の JSON 全体を見て分類せよ」と指示します。
 
 ### 2. Codex hook として登録
 
@@ -181,7 +206,7 @@ Codex は `~/.codex/hooks.json` と `~/.codex/config.toml` から hook を読み
 
 ```toml
 [features]
-codex_hooks = true   # 必須: Codex hooks は experimental で、この feature flag で gate されている
+codex_hooks = true   # 必須: Codex hooks はこの feature flag 配下に置かれている
 
 [[hooks.PermissionRequest]]
 matcher = ""
@@ -212,7 +237,7 @@ Claude Code と同じ環境変数を使います — [provider table](#3-api-キ
 
 - **list**: `allow` / `deny` / `environment` は値を設定した layer が前の layer から引き継いだ list を **置き換える** (`[]` を書けば空 list に置き換え)。`append_*` 系 (`append_allow` / `append_deny` / `append_environment`) は前の layer の累積 list の **末尾に追加** する。
 - **スカラー**: `log_*` / `metrics_*` / `fallthrough_strategy` はその layer がフィールドを設定していれば per-field で上書き、設定していなければ前の値を保持。
-- **`provider` block**: `provider` を書いた layer は block 全体 (`name` + `model` + `base_url` + `timeout_ms`) を **丸ごと置換**。書かなかった layer は前の block をそのまま継承。`name` を切り替えると `model` の名前空間も `base_url` も意味が変わる密結合なので、per-field merge にすると下位 layer の値が残って壊れるため block 単位で扱う。
+- **`provider` block**: `provider` を書いた layer では `provider.*` の全フィールド (`name` / `model` / `base_url` / `auth` / `timeout_ms`) をまとめて置き換えます。書かなかった layer では前の block をそのまま引き継ぎます。`name` を切り替えると `model` の名前空間や `base_url` の意味も変わる密結合のため、フィールド単位では merge しません。注意: project-local 設定で `provider` を再掲する場合、global layer に書いた `auth` ブロックも忘れずに書き写してください。書き漏らすと当該プロジェクトだけ helper 設定が静かに消えます。
 
 `~/.<target>/ccgate.jsonnet` で model だけ変えたい場合でも `provider: {name: 'anthropic', model: 'claude-sonnet-4-6'}` のように block 全体を書き直す必要があります (embedded の `allow` / `deny` はそのまま残ります)。`allow: [...]` を書けば embedded の allow を完全に差し替え (これは v0.6 以前のグローバル設定がすでに行っていた挙動なので、そのまま冪等)。プロジェクトローカル設定は典型的に `append_deny: [...]` / `append_environment: [...]` で追加制限を載せます。
 プロジェクトローカル設定は **Git に追跡されていないファイルのみ** 読み込まれます。
@@ -225,6 +250,7 @@ Claude Code と同じ環境変数を使います — [provider table](#3-api-キ
 | `provider.name`          | string                            | `"anthropic"`                                                                   | プロバイダー名。`"anthropic"` / `"openai"` / `"gemini"` のいずれか                                          |
 | `provider.model`         | string                            | `"claude-haiku-4-5"`                                                            | モデル名。例: `claude-haiku-4-5` / `claude-sonnet-4-6` (anthropic)、`gpt-5.4-nano-2026-03-17` (openai)、`gemini-3-flash-preview` (gemini)。互換 proxy 経由なら proxy が公開している任意の名前 (例: `anthropic/claude-haiku-4-5`) |
 | `provider.base_url`      | string                            | `""`                                                                            | API base URL の上書き。空文字列 (default) で SDK の既定 endpoint を使用。OpenAI 互換 / Anthropic 互換 proxy (LiteLLM proxy, Azure OpenAI, オンプレ gateway, 地域別 endpoint 等) 経由で叩きたい時に指定 |
+| `provider.auth`          | object (`{type, ...}`)            | (省略時は env var)                                                              | 短命 / ローテーションする認証情報を扱う discriminated union。`type=exec` (helper コマンド) / `type=file` (rotator が更新するファイル)。詳細は [api-key-helper.md](api-key-helper.md) |
 | `provider.timeout_ms`    | int                               | `20000`                                                                         | API タイムアウト (ms)。`0` = タイムアウトなし                                                              |
 | `log_path`               | string                            | `$XDG_STATE_HOME/ccgate/<target>/ccgate.log`                                    | ログファイルパス。`~` でホームディレクトリ展開                                                             |
 | `log_disabled`           | bool                              | `false`                                                                         | ログ出力を完全に無効化                                                                                     |
@@ -259,9 +285,9 @@ Claude Code と同じ環境変数を使います — [provider table](#3-api-キ
 
 > **reasoning model は避ける** (`gpt-5`, `gpt-5-mini`, `gpt-5-nano`, `gpt-5-chat`, `o1*`, `o3*`, `o4-mini`): `temperature=0` を拒否するため全リクエストが失敗し、分類タスクには不要な chain-of-thought に数秒かかります。`gpt-4.1-nano` / `gpt-4o-mini` / `gpt-5.4-nano-2026-03-17` を推奨。
 
-### 互換 proxy 経由で叩く
+### 互換 proxy 経由で利用する
 
-ccgate は Anthropic / OpenAI クライアントが使うのと同じ chat completions API を喋るので、**OpenAI 互換 / Anthropic 互換**の任意の endpoint — [LiteLLM proxy](https://docs.litellm.ai/docs/proxy/quick_start), Azure OpenAI, オンプレ gateway, 地域別 endpoint など — に対して動きます。proxy が話すプロトコルに合わせて `provider.base_url` を設定します。
+ccgate は各 provider SDK の標準 chat / messages エンドポイントを使うので、**OpenAI 互換 / Anthropic 互換**の任意の endpoint — [LiteLLM proxy](https://docs.litellm.ai/docs/proxy/quick_start), Azure OpenAI, オンプレ gateway, 地域別 endpoint など — に対して動きます。proxy が話すプロトコルに合わせて `provider.base_url` を設定します。
 
 `provider.base_url` は underlying SDK の `WithBaseURL` にそのまま渡されるので、書く path は **その SDK の慣習**に従います (ccgate 側で正規化しません):
 
@@ -299,15 +325,56 @@ proxy の API キーを `CCGATE_OPENAI_API_KEY` で export。OpenAI SDK は base
 
 proxy の API キーを `CCGATE_ANTHROPIC_API_KEY` で export。Anthropic SDK が `/v1/messages` を自分で append するので、base URL は host root で止めます。
 
+### 期限付き・自動更新される API キー
+
+認証情報が静的な環境変数では追従できない頻度で更新される (AWS STS / Vertex ADC / OpenAI 互換 gateway の virtual key / 社内 key broker など) 場合は `provider.auth` を使います。2 つの形式の discriminated union — 用途に合う方を選びます。
+
+```jsonnet
+// helper コマンドを実行して認証情報を取得
+{
+  provider: {
+    name: 'anthropic',
+    model: 'claude-haiku-4-5',
+    auth: {
+      type: 'exec',
+      command: '/usr/local/bin/my-key-broker --provider anthropic',
+    },
+  },
+}
+
+// 外部 rotator が認証情報をファイルに書き込む
+// (path 省略時は $XDG_STATE_HOME/ccgate/<target>/auth_key.json)
+{
+  provider: {
+    name: 'anthropic',
+    model: 'claude-haiku-4-5',
+    auth: {
+      type: 'file',
+      path: '~/.config/my-broker/anthropic.json',
+    },
+  },
+}
+```
+
+helper / file の中身は次のいずれかを書きます。
+
+- **JSON** `{"key":"sk-...","expires_at":"<RFC3339>"}` — `auth.type=exec` の場合 `$XDG_CACHE_HOME/ccgate/<target>/` にキャッシュされ、期限前に更新されます
+- **plain string** — 単一行の非空文字列。キャッシュなし
+
+解決順序: `provider.auth` (設定済み) > `CCGATE_*_API_KEY` > `*_API_KEY`。`auth` を設定済みのときに失敗しても **env var に黙って fallback はしません**。代わりに `kind=credential_unavailable` で fallthrough します。
+
+ccgate は jsonnet helper として `std.native('env')(name)` (未定義は空文字) と `std.native('must_env')(name)` (未定義は config-load エラー) を register しているので、任意の文字列フィールドから ccgate 独自記法を使わずに env を読めます。
+
+helper の完全な仕様 (動かせる例 / `auth.cache_key` によるアカウント別キャッシュ / 初回ブラウザ認証 / 401/403 の挙動マトリクス / 障害復旧チェックリスト) は [api-key-helper.md](api-key-helper.md) を参照してください。
 ## デフォルトルール
 
 ccgate は target ごとに組み込みのデフォルトルールを持っています。常にベースとして適用され、その上にグローバル / プロジェクトローカル設定が重なります。
 
 **許可:** 読み取り専用操作、ローカル開発コマンド (project script 経由の build / test)、git フィーチャーブランチ操作、リポジトリ内に閉じたパッケージインストール。
 
-**拒否:** リモートコードのダウンロード実行 (`curl|bash`)、direct one-shot remote package execution (`npx`/`pnpx`/`bunx` 等)、git 破壊的操作 (protected branch 含む)、リポジトリ外の削除、特権昇格。
+**拒否:** リモートコードのダウンロード実行 (`curl|bash`)、リモートパッケージの直接実行 (`npx` / `pnpx` / `bunx` 等)、git 破壊的操作 (protected branch 含む)、リポジトリ外の削除、特権昇格。
 
-`ccgate claude init` / `ccgate codex init` でデフォルト設定の全容を確認できます。`init` の出力は **embedded defaults そのもの** = リファレンス文書であって、コピペして使う出発点ではありません。自分のオーバーライドは追加 / 上書きしたい分だけを書く最小限の jsonnet にしてください:
+`ccgate claude init` / `ccgate codex init` で組み込みデフォルトの全容を確認できます。ccgate は品質改善のためにデフォルトを更新することがあり、`append_*` 形式で書いている設定はそのまま新デフォルトを取り込みますが、`allow:` / `deny:` で丸ごと置き換えている場合は、新デフォルトと自分の上書きを突き合わせて反映するかを都度判断する必要があります:
 
 ```bash
 ccgate claude init           | less                   # Claude embedded defaults を確認
@@ -316,7 +383,7 @@ ccgate claude init -p > .claude/ccgate.local.jsonnet  # プロジェクトロー
 ccgate codex  init -p > .codex/ccgate.local.jsonnet   # Codex も同じ
 ```
 
-embedded のルールを **削除** したい場合は明示的な reset/override 構文が必要ですが、現状そのような仕組みはありません。ルールと動機を Issue に書いてもらえれば検討します。
+embedded のルールを 1 件だけ削除する仕組みはありません。リストを `allow:` / `deny:` で丸ごと差し替えて、削除したいルールだけ自分のコピーから抜いてください。
 
 ## 完全自動運転モード (`fallthrough_strategy`)
 
@@ -339,7 +406,7 @@ embedded のルールを **削除** したい場合は明示的な reset/overrid
 
 対象は **LLM 判定の fallthrough に限定** です。API 応答の打ち切り/拒否、API キー欠損、`bypassPermissions`/`dontAsk` モード (Claude のみ)、`ExitPlanMode` / `AskUserQuestion` (Claude のみ) はいずれも従来通り上流ツールにフォールスルーされます。
 
-強制発火した回数は `ccgate <target> metrics` の `F.Allow` / `F.Deny` 列 (JSON では `forced_allow` / `forced_deny`) で確認できるため、選んだ戦略が妥当に機能しているか後から監査できます。
+強制的に allow / deny へ変換された回数は `ccgate <target> metrics` の `F.Allow` / `F.Deny` 列 (JSON では `forced_allow` / `forced_deny`) で確認できるため、選んだ戦略が妥当に機能しているか後から監査できます。
 
 ## ログ・メトリクス
 
@@ -367,13 +434,14 @@ ccgate codex  metrics --days 7        # codex 側、同じシェイプ
 
 - **Plan mode の正しさはプロンプトのみに依存 (Claude のみ)。** `permission_mode == "plan"` では、(a) 実装系 write を拒絶する判定と (b) allow guidance に載っていない read-only クエリを許可する判定の両方を、LLM とシステムプロンプトの指示文に委ねています。プロンプトで記述する以上、どちらの方向にも誤判定の余地があります。[#37](https://github.com/tak848/ccgate/issues/37) で追跡しています。
 - **embedded default の特定ルールだけを部分削除する手段なし。** layer は list を **完全置換** (`allow: [...]`) するか **末尾追加** (`append_allow: [...]`) するかのどちらかです。embedded の中の 1 ルールだけ消したい場合は、その 1 件を除いた残り全部を `allow:` / `deny:` に書き直すしかありません。
-- **Codex hook は upstream で experimental。** スキーマや挙動が変わる可能性があります。ccgate は現在 Codex 側の `permission_mode` を expose せず、transcript JSONL を parse せず、`~/.codex/config.toml` も取り込まず、MCP server 単位の trust hint も適用しません。判定は `tool_name` + `tool_input` + `cwd` のみで行います。
+- **Codex hook の schema は変わる可能性があります。** Codex hooks 自体が upstream の `features.codex_hooks = true` flag 配下にあり、まだ進化中です。ccgate は現在 Codex 側の `permission_mode` を expose せず、transcript JSONL を parse せず、`~/.codex/config.toml` も取り込まず、MCP server 単位の trust hint も適用しません。判定は `tool_name` + `tool_input` + `cwd` のみで行います。
 
 ## ドキュメント
 
-- [docs/ja/claude.md](claude.md) — Claude Code 固有
-- [docs/ja/codex.md](codex.md) — Codex CLI 固有
-- [docs/ja/configuration.md](configuration.md) — 設定 layering、fallthrough_strategy、metrics、既知の制約
+- [claude.md](claude.md) — Claude Code 固有
+- [codex.md](codex.md) — Codex CLI 固有
+- [configuration.md](configuration.md) — 設定 layering、fallthrough_strategy、metrics、既知の制約
+- [api-key-helper.md](api-key-helper.md) — `provider.auth` リファレンス (helper の契約、キャッシュ、初回ブラウザ認証、401/403 挙動、復旧手順)
 - [English documentation (docs/)](../claude.md)
 
 ## 開発

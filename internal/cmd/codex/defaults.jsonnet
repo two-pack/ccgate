@@ -11,6 +11,14 @@
 // written tool-agnostically and reference Bash command shapes only as
 // concrete examples; the LLM should classify by tool_name + tool_input
 // regardless of which surface delivered the request.
+//
+// To customize, write either:
+//   - ~/.codex/ccgate.jsonnet (global), or
+//   - <repo>/.codex/ccgate.local.jsonnet (project-local, untracked-only)
+// and at either layer use append_* to add on top of what's inherited
+// (picks up future ccgate quality updates automatically), or allow /
+// deny / environment to replace the inherited list wholesale. See the
+// README "Setup -- Codex CLI" for examples.
 
 {
   ['$schema']: 'https://raw.githubusercontent.com/tak848/ccgate/main/schemas/codex.schema.json',
@@ -21,12 +29,17 @@
     // Alternatives:
     //   name: 'openai',  model: 'gpt-4o-mini',        (env: OPENAI_API_KEY)
     //   name: 'gemini',  model: 'gemini-2.0-flash',    (env: GEMINI_API_KEY)
-    // base_url: '...' overrides the provider's API endpoint. Point it
-    // at an OpenAI-/Anthropic-compatible proxy (LiteLLM proxy, Azure
-    // OpenAI, on-prem gateway, regional endpoint, ...) when you don't
-    // want ccgate to hit the vendor directly. Required path for
-    // OpenAI-compatible endpoints is `.../v1`; Anthropic-compatible
-    // endpoints take the host root and the SDK appends `/v1/messages`.
+    // base_url:  route through an OpenAI-/Anthropic-compatible proxy.
+    //            See README "Routing through a compatible proxy".
+    // timeout_ms: API timeout in ms, default 20000.
+    // auth: short-lived / rotating credentials. Discriminated
+    //   by auth.type:
+    //     auth: { type: 'exec', command: '/usr/local/bin/my-broker --provider anthropic' }
+    //     auth: { type: 'file', path: '~/.config/my-broker/anthropic.json' }
+    //   The provider block is replaced atomically across config layers,
+    //   so a project-local config that restates `provider` must repeat
+    //   the auth block. See docs/api-key-helper.md for the full helper
+    //   contract, examples, and recovery checklist.
   },
 
   // What to do when the LLM is uncertain (returns "fallthrough"):

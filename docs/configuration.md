@@ -26,7 +26,7 @@ ccgate evaluates three layers, in order, per target. Every layer composes with t
 | Lists: `allow`, `deny`, `environment` | A layer that sets the field **replaces** the carried-over list (even with `[]`). A layer that omits the field leaves the carried-over list untouched. | Embedded `allow: ["A","B"]` + global `allow: ["X"]` → final `allow: ["X"]`. |
 | Lists: `append_allow`, `append_deny`, `append_environment` | A layer that sets the field **appends** its entries to whatever the previous layers produced. | Embedded `deny: ["A"]` + project `append_deny: ["P"]` → final `deny: ["A","P"]`. |
 | Scalars: `log_*`, `metrics_*`, `fallthrough_strategy` | A layer **overwrites** the value per-field when it sets it; layers that omit a field leave the previous value untouched. | Embedded `log_max_size: 5MB` + global `log_max_size: 10MB` → final `log_max_size: 10MB`. |
-| Block: `provider` (`name` / `model` / `base_url` / `timeout_ms`) | A layer that writes `provider` **replaces the entire block**; layers that omit `provider` leave it untouched. Per-field merge would let stale fields from a lower layer (e.g. a proxy `base_url`) leak into a different provider when a higher layer switches `name`. | Embedded `provider: {name: anthropic, model: haiku}` + global `provider: {name: openai, model: gpt-5.4-nano-2026-03-17}` → final `provider: {name: openai, model: gpt-5.4-nano-2026-03-17}`. To bump only the model, restate the whole block: `provider: {name: anthropic, model: claude-sonnet-4-6}`. |
+| Block: `provider` (every `provider.*` field, including `name` / `model` / `base_url` / `auth` / `timeout_ms`) | A layer that writes `provider` **replaces the entire block**; layers that omit `provider` leave it untouched. Per-field merge would let stale fields from a lower layer (e.g. a proxy `base_url`, or a helper `auth.command`) leak into a different provider when a higher layer switches `name`. | Embedded `provider: {name: anthropic, model: haiku}` + global `provider: {name: openai, model: gpt-5.4-nano-2026-03-17}` → final `provider: {name: openai, model: gpt-5.4-nano-2026-03-17}`. To bump only the model, restate the whole block: `provider: {name: anthropic, model: claude-sonnet-4-6}`. When a global layer sets `auth`, any project-local `provider` override must repeat the whole `auth` block or the helper is silently dropped on that project. |
 
 `allow` and `append_allow` (same for the other lists) can coexist in the same layer: the replace runs first, then the append stacks onto the result. Use the pattern when you want to **swap** the embedded list for a curated one and **also** add a couple of project-specific extras: `{ allow: ['only this base'], append_allow: ['plus this project rule'] }`.
 
@@ -109,6 +109,7 @@ ccgate codex  metrics --days 7         # same shape, codex side
   "ft_kind": "",
   "forced": false,
   "reason": "Read-only inspection inside repo; matches allow guidance.",
+  "credential_source": "",
   "deny_msg": "",
   "model": "claude-haiku-4-5",
   "in_tok": 4321,
@@ -121,16 +122,53 @@ ccgate codex  metrics --days 7         # same shape, codex side
 }
 ```
 
-`ft_kind` is filled when the LLM returned (or the runtime forced) a fallthrough; the value tells you which fallback path fired (`llm`, `api_unusable`, `no_apikey`, `unknown_provider`, `bypass`, `dontask`, `user_interaction`). `forced=true` means `fallthrough_strategy` promoted an LLM `fallthrough` into the recorded `decision`.
+`ft_kind` is filled when the LLM returned (or the runtime forced) a fallthrough; the value tells you which fallback path fired (`llm`, `api_unusable`, `no_apikey`, `credential_unavailable`, `unknown_provider`, `bypass`, `dontask`, `user_interaction`). `forced=true` means `fallthrough_strategy` promoted an LLM `fallthrough` into the recorded `decision`.
+
+`credential_source` is set only when `ft_kind=credential_unavailable`. It carries the keystore stage that produced (or failed to produce) the credential — currently `exec` / `file` / `cache` / `lock` (matching `auth.type=exec` for the helper-exec path) — so the same `reason` can be grouped by where it actually broke. The set is open: future credential paths (e.g. an `OAuth refresh` stage, a Windows native backend) may add new values, so consumers parsing this field should treat it as a free-form short string and tolerate unknown values rather than enum-validate it.
+
+The `reason` field meaning depends on `ft_kind`:
+
+- `ft_kind=llm`: free-form text the LLM emitted to justify its fallthrough.
+- `ft_kind=credential_unavailable`: a secret-free classifier from the table below.
+
+#### Reason values for `credential_unavailable`
+
+| Reason                  | Meaning                                                                                                |
+|-------------------------|--------------------------------------------------------------------------------------------------------|
+| `command_exit`          | `auth.command` exited non-zero.                                                                        |
+| `json_parse`            | Helper / file produced JSON that failed strict parsing or had no `key`.                                |
+| `invalid_expiration`    | Helper / file JSON parsed but `expires_at` was not RFC3339.                                            |
+| `empty_output`          | Plain-string output was empty after trim.                                                              |
+| `invalid_plain_output`  | Plain-string output had internal newlines (multi-line is rejected).                                    |
+| `expired`               | `expires_at` was already in the past, or remaining TTL was below `auth.refresh_margin_ms`, at read time.  |
+| `file_missing`          | `auth.path` did not exist.                                                                             |
+| `file_read`             | `auth.path` exists but failed to read (permissions, FS error).                                         |
+| `timeout`               | `auth.command` exceeded `auth.timeout_ms`.                                                              |
+| `output_too_large`      | Helper stdout exceeded the 64 KiB limit.                                                               |
+| `lock_timeout`          | flock retry budget exhausted while peers were refreshing.                                              |
+| `lock_error`            | flock syscall returned a non-EWOULDBLOCK error (broken lock subsystem; helper exec is skipped).        |
+| `cache_unavailable`     | Cache directory cannot be created / `chmod`'d. Treated as fail-fast (helper exec is skipped) because without the sibling lock file we cannot prevent concurrent helpers from racing the broker. |
+| `provider_auth`         | Provider rejected the credential with **HTTP 401 or 403**. `auth.type=exec` invalidates the cache so the next fire re-runs the helper; `auth.type=file` falls through (no cache to clear); env-var keys are **not** routed here because ccgate cannot rotate env vars and swallowing the rejection would hide user-side misconfiguration. |
+
+`credential_unavailable` is therefore wider than just "credential resolution failed": it also covers "provider received and rejected the credential" (401 / 403).
+
+#### Log-only credential warnings (not in metrics)
+
+The cache layer recovers from these without falling through, so they are emitted as `slog.Warn` only and never appear in metrics:
+
+- `cache_parse` — corrupt cache JSON; unlinked, helper re-runs.
+- `cache_read` — cache read error; unlinked, helper re-runs.
+- `cache_write` — cache write / atomic-rename failed; fresh key returned uncached.
 
 ### Drill-down sections
 
-`ccgate <target> metrics` adds two sections by default:
+`ccgate <target> metrics` adds three sections by default:
 
 - **Top fallthrough commands** -- the most frequent operations that the LLM was unsure about. These are good candidates for a project-local allow / deny rule that lets ccgate skip the LLM round-trip entirely.
 - **Top deny commands** -- the most frequent operations the LLM denied. Useful when an automated job keeps trying the same blocked thing -- often a sign that the AI's plan needs a different shape.
+- **Credential failures** -- aggregated from `ft_kind=credential_unavailable` entries, grouped by `(source, reason)`. Tool input is intentionally ignored here (every fire during a credential outage carries the same source/reason regardless of the tool the user invoked). Cache-layer warnings do not appear here; check `ccgate.log` for those.
 
-Pass `--details 0` to suppress both sections, or `--details N` to limit each to the top N rows.
+Pass `--details 0` to suppress the fallthrough / deny sections, or `--details N` to limit each to the top N rows.
 
 ### Disabling, redirecting, rotation
 
@@ -151,5 +189,5 @@ The same fields exist for the log file (`log_path`, `log_disabled`, `log_max_siz
 
 - **Plan mode (Claude only) is prompt-only.** Under `permission_mode == "plan"`, ccgate relies on the LLM plus prose in the system prompt to (a) reject implementation-side writes and (b) allow read-only queries without an explicit allow-guidance match. Either side can misfire. Tracked in [#37](https://github.com/tak848/ccgate/issues/37).
 - **No surgical reset for a single embedded default rule.** A layer either replaces a list wholesale or appends to it; removing one specific embedded entry while keeping the rest requires re-stating the whole list under `allow` / `deny` minus that one entry.
-- **Codex hook is upstream-experimental.** The hook schema may change without notice.
+- **Codex hook schema may change.** Codex hooks live behind upstream's `features.codex_hooks = true` flag and are still evolving.
 - **Codex `~/.codex/config.toml` ingestion** (`approval_policy`, `sandbox_mode`, `prefix_rules`) is not implemented yet. ccgate decides purely from the hook payload + ccgate config; if Codex's own settings would have rejected something, that signal does not reach the LLM today.

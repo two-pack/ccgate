@@ -6,7 +6,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 )
 
 // setHomeEnv sets the env var that os.UserHomeDir consults on the current OS.
@@ -77,6 +79,158 @@ func TestValidateErrors(t *testing.T) {
 			t.Parallel()
 			if err := tt.cfg.Validate(); err == nil {
 				t.Fatal("expected validation error")
+			}
+		})
+	}
+}
+
+func TestValidateAuthFields(t *testing.T) {
+	t.Parallel()
+
+	base := func(a *AuthConfig) Config {
+		// Required fields filled in so the only validation outcome we
+		// observe is whatever the table case targets.
+		return Config{Provider: ProviderConfig{
+			Name:      "anthropic",
+			Model:     "m",
+			TimeoutMS: intPtr(1000),
+			Auth:      a,
+		}}
+	}
+
+	// Build OS-absolute paths so the file-branch cases pass on
+	// Windows too (filepath.IsAbs rejects bare `/k` on Windows; it
+	// wants a drive letter or UNC).
+	abs := func(rel string) string {
+		p, err := filepath.Abs(rel)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	absKey := abs("k")
+
+	cases := map[string]struct {
+		auth    *AuthConfig
+		wantErr bool
+	}{
+		// auth omit = env var path, must validate cleanly.
+		"omit auth": {auth: nil, wantErr: false},
+
+		// type=exec: command required, refresh_margin/timeout/cache_key optional.
+		"exec ok":                 {auth: &AuthConfig{Type: "exec", Command: "echo"}, wantErr: false},
+		"exec missing command":    {auth: &AuthConfig{Type: "exec"}, wantErr: true},
+		"exec with path":          {auth: &AuthConfig{Type: "exec", Command: "x", Path: stringPtr("y")}, wantErr: true},
+		"exec with cache_key":     {auth: &AuthConfig{Type: "exec", Command: "x", CacheKey: "prod"}, wantErr: false},
+		"exec with cache_key var": {auth: &AuthConfig{Type: "exec", Command: "x", CacheKey: "${AWS_PROFILE}"}, wantErr: false},
+
+		// refresh_margin_ms: >= 0 accepted, 0 allowed (disables guard),
+		// negative rejected.
+		"refresh_margin 30000": {auth: &AuthConfig{Type: "exec", Command: "x", RefreshMarginMS: intPtr(30000)}, wantErr: false},
+		"refresh_margin 0":     {auth: &AuthConfig{Type: "exec", Command: "x", RefreshMarginMS: intPtr(0)}, wantErr: false},
+		"refresh_margin -1":    {auth: &AuthConfig{Type: "exec", Command: "x", RefreshMarginMS: intPtr(-1)}, wantErr: true},
+
+		// timeout_ms: > 0 required, 0 rejected (would wedge hot path).
+		"timeout 5000":     {auth: &AuthConfig{Type: "exec", Command: "x", TimeoutMS: intPtr(5000)}, wantErr: false},
+		"timeout 0":        {auth: &AuthConfig{Type: "exec", Command: "x", TimeoutMS: intPtr(0)}, wantErr: true},
+		"timeout negative": {auth: &AuthConfig{Type: "exec", Command: "x", TimeoutMS: intPtr(-1)}, wantErr: true},
+
+		// type=file: path required (absolute or ~/), command/timeout_ms/cache_key forbidden,
+		// refresh_margin_ms allowed (minimum-remaining-TTL guard).
+		"file abs":               {auth: &AuthConfig{Type: "file", Path: stringPtr(absKey)}, wantErr: false},
+		"file home":              {auth: &AuthConfig{Type: "file", Path: stringPtr("~/.ccgate/key")}, wantErr: false},
+		"file relative dot":      {auth: &AuthConfig{Type: "file", Path: stringPtr("./key")}, wantErr: false},
+		"file relative bare":     {auth: &AuthConfig{Type: "file", Path: stringPtr("key")}, wantErr: false},
+		"file path omitted":      {auth: &AuthConfig{Type: "file"}, wantErr: false},
+		"file path empty string": {auth: &AuthConfig{Type: "file", Path: stringPtr("")}, wantErr: true},
+		"file bare ~":            {auth: &AuthConfig{Type: "file", Path: stringPtr("~")}, wantErr: true},
+		"file bare ~/":           {auth: &AuthConfig{Type: "file", Path: stringPtr("~/")}, wantErr: true},
+		"file with command":      {auth: &AuthConfig{Type: "file", Path: stringPtr(absKey), Command: "x"}, wantErr: true},
+		"file with timeout":      {auth: &AuthConfig{Type: "file", Path: stringPtr(absKey), TimeoutMS: intPtr(5000)}, wantErr: false},
+		"file with zero timeout": {auth: &AuthConfig{Type: "file", Path: stringPtr(absKey), TimeoutMS: intPtr(0)}, wantErr: true},
+		"file with cache_key":    {auth: &AuthConfig{Type: "file", Path: stringPtr(absKey), CacheKey: "x"}, wantErr: true},
+		"file refresh_margin":    {auth: &AuthConfig{Type: "file", Path: stringPtr(absKey), RefreshMarginMS: intPtr(60000)}, wantErr: false},
+
+		// Unknown type values are rejected — keeps the discriminator
+		// closed so editors and validate agree on what's accepted.
+		"unknown type":   {auth: &AuthConfig{Type: "wif"}, wantErr: true},
+		"empty type":     {auth: &AuthConfig{Type: ""}, wantErr: true},
+		"missing fields": {auth: &AuthConfig{Type: "exec"}, wantErr: true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			err := base(tc.auth).Validate()
+			if tc.wantErr && err == nil {
+				t.Fatal("expected validation error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected validation error: %v", err)
+			}
+		})
+	}
+}
+
+func TestAuthDurationDefaults(t *testing.T) {
+	t.Parallel()
+
+	a := AuthConfig{}
+	wantMargin := time.Duration(DefaultAuthRefreshMarginMS) * time.Millisecond
+	wantTimeout := time.Duration(DefaultAuthTimeoutMS) * time.Millisecond
+	if got := a.GetRefreshMargin(); got != wantMargin {
+		t.Fatalf("GetRefreshMargin() default = %s, want %s", got, wantMargin)
+	}
+	if got := a.GetTimeout(); got != wantTimeout {
+		t.Fatalf("GetTimeout() default = %s, want %s", got, wantTimeout)
+	}
+
+	a.RefreshMarginMS = intPtr(90000)
+	a.TimeoutMS = intPtr(12000)
+	if got := a.GetRefreshMargin(); got != 90*time.Second {
+		t.Fatalf("GetRefreshMargin() = %s, want 90s", got)
+	}
+	if got := a.GetTimeout(); got != 12*time.Second {
+		t.Fatalf("GetTimeout() = %s, want 12s", got)
+	}
+}
+
+// TestRejectUnknownFields makes sure the JSON decoder rejects any
+// field the Config struct does not declare. We exercise both
+// previously-proposed names (the api_key_* set, which were renamed
+// to provider.auth before any release shipped them) and a generic
+// typo (`base_url_typo`) to keep the contract uniform: there is no
+// special-cased "migrate from X" path for any specific field, the
+// rejection is the same shape regardless of which key was wrong.
+// Catches typos in any layer of the config — provider, top-level,
+// or otherwise — without us having to anticipate which fields users
+// might mistype.
+func TestRejectUnknownFields(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]struct {
+		snippet string
+		wantKey string
+	}{
+		"api_key_command":         {`{"provider": {"name": "anthropic", "api_key_command": "echo"}}`, "api_key_command"},
+		"api_key_file":            {`{"provider": {"name": "anthropic", "api_key_file": "/x"}}`, "api_key_file"},
+		"api_key_refresh_margin":  {`{"provider": {"name": "anthropic", "api_key_refresh_margin": "30s"}}`, "api_key_refresh_margin"},
+		"api_key_command_timeout": {`{"provider": {"name": "anthropic", "api_key_command_timeout": "5s"}}`, "api_key_command_timeout"},
+		"provider typo":           {`{"provider": {"name": "anthropic", "base_url_typo": "x"}}`, "base_url_typo"},
+		"top-level typo":          {`{"alllow": ["x"]}`, "alllow"},
+		"auth typo":               {`{"provider": {"name": "anthropic", "auth": {"type": "exec", "command": "echo", "cmd": "x"}}}`, "cmd"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			cfg := Default()
+			err := mergeConfigJSON(tc.snippet, &cfg)
+			if err == nil {
+				t.Fatalf("expected unknown-field error for %q", name)
+			}
+			// The Go decoder produces `unknown field "X"` — assert on
+			// the field name only, no special-cased migration phrasing.
+			if !strings.Contains(err.Error(), tc.wantKey) {
+				t.Fatalf("error %q must mention the offending key %q", err.Error(), tc.wantKey)
 			}
 		})
 	}
@@ -177,7 +331,19 @@ func TestMergeConfigFileReplacesProviderBlock(t *testing.T) {
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.jsonnet")
-	content := `{ provider: { name: "openai", model: "custom-model", base_url: "https://proxy.example/v1", timeout_ms: 30000 } }`
+	content := `{ provider: {
+		name: "openai",
+		model: "custom-model",
+		base_url: "https://proxy.example/v1",
+		auth: {
+			type: "exec",
+			command: "echo sk-test",
+			refresh_margin_ms: 45000,
+			timeout_ms: 8000,
+			cache_key: "prod",
+		},
+		timeout_ms: 30000,
+	} }`
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -198,6 +364,31 @@ func TestMergeConfigFileReplacesProviderBlock(t *testing.T) {
 	}
 	if cfg.Provider.BaseURL != "https://proxy.example/v1" {
 		t.Fatalf("base_url = %q, want %q", cfg.Provider.BaseURL, "https://proxy.example/v1")
+	}
+	auth := cfg.Provider.Auth
+	if auth == nil {
+		t.Fatal("auth is nil after merge")
+	}
+	if auth.Type != "exec" {
+		t.Fatalf("auth.type = %q, want %q", auth.Type, "exec")
+	}
+	if auth.Command != "echo sk-test" {
+		t.Fatalf("auth.command = %q, want %q", auth.Command, "echo sk-test")
+	}
+	if auth.RefreshMarginMS == nil || *auth.RefreshMarginMS != 45000 {
+		t.Fatalf("auth.refresh_margin_ms = %v, want 45000", auth.RefreshMarginMS)
+	}
+	if got := auth.GetRefreshMargin(); got != 45*time.Second {
+		t.Fatalf("GetRefreshMargin() = %s, want 45s", got)
+	}
+	if auth.TimeoutMS == nil || *auth.TimeoutMS != 8000 {
+		t.Fatalf("auth.timeout_ms = %v, want 8000", auth.TimeoutMS)
+	}
+	if got := auth.GetTimeout(); got != 8*time.Second {
+		t.Fatalf("GetTimeout() = %s, want 8s", got)
+	}
+	if auth.CacheKey != "prod" {
+		t.Fatalf("auth.cache_key = %q, want %q", auth.CacheKey, "prod")
 	}
 	if cfg.Provider.GetTimeoutMS() != 30000 {
 		t.Fatalf("timeout_ms = %d, want 30000", cfg.Provider.GetTimeoutMS())

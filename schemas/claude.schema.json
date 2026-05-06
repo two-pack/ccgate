@@ -2,6 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/tak848/ccgate/main/schemas/claude.schema.json",
   "properties": {
+    "$schema": {
+      "type": "string",
+      "format": "uri",
+      "description": "JSON schema reference. Editors use this to enable validation; ccgate ignores it at runtime."
+    },
     "provider": {
       "properties": {
         "name": {
@@ -12,6 +17,80 @@
         },
         "base_url": {
           "type": "string"
+        },
+        "auth": {
+          "oneOf": [
+            {
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "exec"
+                },
+                "command": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Shell command. Stdout is the credential. Run via the configured shell (default bash)."
+                },
+                "shell": {
+                  "type": "string",
+                  "enum": [
+                    "bash",
+                    "powershell"
+                  ],
+                  "description": "Shell that runs `command`. \"bash\" runs `bash -c \u003ccommand\u003e`. \"powershell\" runs `pwsh -Command \u003ccommand\u003e` when pwsh is on PATH (PowerShell 7+, cross-platform) and falls back to `powershell -Command \u003ccommand\u003e` (Windows PowerShell 5.1) otherwise. Default: bash."
+                },
+                "refresh_margin_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "Cache early-refresh threshold + minimum remaining TTL guard for fresh credentials, in milliseconds. Default: 60000."
+                },
+                "timeout_ms": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Hard cap on one Resolve call (lock + helper exec), in milliseconds. Default: 30000."
+                },
+                "cache_key": {
+                  "type": "string",
+                  "description": "Secret-free salt added to the cache fingerprint so a single command string can produce per-account cache entries (used as-is; pull env values via jsonnet std.native('env') / std.native('must_env'))."
+                }
+              },
+              "additionalProperties": false,
+              "type": "object",
+              "required": [
+                "type",
+                "command"
+              ]
+            },
+            {
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "file"
+                },
+                "path": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Path to the credential file. Absolute, ~/-prefixed, or relative (relative paths resolve from the hook's working directory at fire time, not the config file's directory). Omit the field to use the default $XDG_STATE_HOME/ccgate/\u003ctarget\u003e/auth_key.json; do not set it to an empty string."
+                },
+                "refresh_margin_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "Minimum remaining TTL guard for file output, in milliseconds. Default: 60000."
+                },
+                "timeout_ms": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Hard cap on the file read so a stalled mount surfaces as reason=timeout. Default: 30000."
+                }
+              },
+              "additionalProperties": false,
+              "type": "object",
+              "required": [
+                "type"
+              ]
+            }
+          ],
+          "title": "auth"
         },
         "timeout_ms": {
           "type": "integer"
@@ -80,11 +159,6 @@
         "type": "string"
       },
       "type": "array"
-    },
-    "$schema": {
-      "type": "string",
-      "format": "uri",
-      "description": "JSON schema reference. Editors use this to enable validation; ccgate ignores it at runtime."
     }
   },
   "additionalProperties": false,
